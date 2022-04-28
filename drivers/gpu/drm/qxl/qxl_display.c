@@ -25,7 +25,7 @@
 
 #include <linux/crc32.h>
 #include <linux/delay.h>
-#include <linux/dma-buf-map.h>
+#include <linux/iosys-map.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_atomic.h>
@@ -566,8 +566,8 @@ static struct qxl_bo *qxl_create_cursor(struct qxl_device *qdev,
 {
 	static const u32 size = 64 * 64 * 4;
 	struct qxl_bo *cursor_bo;
-	struct dma_buf_map cursor_map;
-	struct dma_buf_map user_map;
+	struct iosys_map cursor_map;
+	struct iosys_map user_map;
 	struct qxl_cursor cursor;
 	int ret;
 
@@ -677,10 +677,8 @@ static void qxl_primary_atomic_disable(struct drm_plane *plane,
 
 		if (bo->shadow)
 			bo = bo->shadow;
-		if (bo->is_primary) {
+		if (bo->is_primary)
 			qxl_io_destroy_primary(qdev);
-			bo->is_primary = false;
-		}
 	}
 }
 
@@ -803,6 +801,7 @@ static void qxl_prepare_shadow(struct qxl_device *qdev, struct qxl_bo *user_bo,
 	    qdev->dumb_shadow_bo->surf.width  != surf.width ||
 	    qdev->dumb_shadow_bo->surf.height != surf.height) {
 		if (qdev->dumb_shadow_bo) {
+			qxl_bo_unpin(qdev->dumb_shadow_bo);
 			drm_gem_object_put
 				(&qdev->dumb_shadow_bo->tbo.base);
 			qdev->dumb_shadow_bo = NULL;
@@ -1184,7 +1183,7 @@ int qxl_create_monitors_object(struct qxl_device *qdev)
 {
 	int ret;
 	struct drm_gem_object *gobj;
-	struct dma_buf_map map;
+	struct iosys_map map;
 	int monitors_config_size = sizeof(struct qxl_monitors_config) +
 		qxl_num_crtc * sizeof(struct qxl_head);
 

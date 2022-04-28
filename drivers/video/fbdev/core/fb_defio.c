@@ -52,6 +52,14 @@ static vm_fault_t fb_deferred_io_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	get_page(page);
+
+	if (vmf->vma->vm_file)
+		page->mapping = vmf->vma->vm_file->f_mapping;
+	else
+		printk(KERN_ERR "no mapping available\n");
+
+	BUG_ON(!page->mapping);
+	INIT_LIST_HEAD(&page->lru);
 	page->index = vmf->pgoff;
 
 	vmf->page = page;
@@ -88,7 +96,7 @@ static vm_fault_t fb_deferred_io_mkwrite(struct vm_fault *vmf)
 	struct page *page = vmf->page;
 	struct fb_info *info = vmf->vma->vm_private_data;
 	struct fb_deferred_io *fbdefio = info->fbdefio;
-	struct page *cur;
+	struct list_head *pos = &fbdefio->pagelist;
 
 	/* this is a callback we get when userspace first tries to
 	write to the page. we schedule a workqueue. that workqueue
@@ -115,21 +123,38 @@ static vm_fault_t fb_deferred_io_mkwrite(struct vm_fault *vmf)
 	 */
 	lock_page(page);
 
-	/* we loop through the pagelist before adding in order
-	to keep the pagelist sorted */
-	list_for_each_entry(cur, &fbdefio->pagelist, lru) {
-		/* this check is to catch the case where a new
-		process could start writing to the same page
-		through a new pte. this new access can cause the
-		mkwrite even when the original ps's pte is marked
-		writable */
-		if (unlikely(cur == page))
-			goto page_already_added;
-		else if (cur->index > page->index)
-			break;
+	/*
+	 * This check is to catch the case where a new process could start
+	 * writing to the same page through a new PTE. This new access
+	 * can cause a call to .page_mkwrite even if the original process'
+	 * PTE is marked writable.
+	 *
+	 * TODO: The lru field is owned by the page cache; hence the name.
+	 *       We dequeue in fb_deferred_io_work() after flushing the
+	 *       page's content into video memory. Instead of lru, fbdefio
+	 *       should have it's own field.
+	 */
+	if (!list_empty(&page->lru))
+		goto page_already_added;
+
+	if (unlikely(fbdefio->sort_pagelist)) {
+		/*
+		 * We loop through the pagelist before adding in order to
+		 * keep the pagelist sorted. This has significant overhead
+		 * of O(n^2) with n being the number of written pages. If
+		 * possible, drivers should try to work with unsorted page
+		 * lists instead.
+		 */
+		struct page *cur;
+
+		list_for_each_entry(cur, &fbdefio->pagelist, lru) {
+			if (cur->index > page->index)
+				break;
+		}
+		pos = &cur->lru;
 	}
 
-	list_add_tail(&page->lru, &cur->lru);
+	list_add_tail(&page->lru, pos);
 
 page_already_added:
 	mutex_unlock(&fbdefio->lock);
@@ -142,6 +167,10 @@ page_already_added:
 static const struct vm_operations_struct fb_deferred_io_vm_ops = {
 	.fault		= fb_deferred_io_fault,
 	.page_mkwrite	= fb_deferred_io_mkwrite,
+};
+
+static const struct address_space_operations fb_deferred_io_aops = {
+	.dirty_folio	= noop_dirty_folio,
 };
 
 int fb_deferred_io_mmap(struct fb_info *info, struct vm_area_struct *vma)
@@ -176,7 +205,7 @@ static void fb_deferred_io_work(struct work_struct *work)
 
 	/* clear the list */
 	list_for_each_safe(node, next, &fbdefio->pagelist) {
-		list_del(node);
+		list_del_init(node);
 	}
 	mutex_unlock(&fbdefio->lock);
 }
@@ -194,12 +223,29 @@ void fb_deferred_io_init(struct fb_info *info)
 }
 EXPORT_SYMBOL_GPL(fb_deferred_io_init);
 
+void fb_deferred_io_open(struct fb_info *info,
+			 struct inode *inode,
+			 struct file *file)
+{
+	file->f_mapping->a_ops = &fb_deferred_io_aops;
+}
+EXPORT_SYMBOL_GPL(fb_deferred_io_open);
+
 void fb_deferred_io_cleanup(struct fb_info *info)
 {
 	struct fb_deferred_io *fbdefio = info->fbdefio;
+	struct page *page;
+	int i;
 
 	BUG_ON(!fbdefio);
 	cancel_delayed_work_sync(&info->deferred_work);
+
+	/* clear out the mapping that we setup */
+	for (i = 0 ; i < info->fix.smem_len; i += PAGE_SIZE) {
+		page = fb_deferred_io_page(info, i);
+		page->mapping = NULL;
+	}
+
 	mutex_destroy(&fbdefio->lock);
 }
 EXPORT_SYMBOL_GPL(fb_deferred_io_cleanup);

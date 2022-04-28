@@ -172,7 +172,7 @@ static int dccp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 			 * Wake people up to see the error
 			 * (see connect in sock.c)
 			 */
-			sk->sk_error_report(sk);
+			sk_error_report(sk);
 			dccp_done(sk);
 		} else
 			sk->sk_err_soft = err;
@@ -181,7 +181,7 @@ static int dccp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 
 	if (!sock_owned_by_user(sk) && np->recverr) {
 		sk->sk_err = err;
-		sk->sk_error_report(sk);
+		sk_error_report(sk);
 	} else
 		sk->sk_err_soft = err;
 
@@ -1115,15 +1115,9 @@ static void __net_exit dccp_v6_exit_net(struct net *net)
 	inet_ctl_sock_destroy(pn->v6_ctl_sk);
 }
 
-static void __net_exit dccp_v6_exit_batch(struct list_head *net_exit_list)
-{
-	inet_twsk_purge(&dccp_hashinfo, AF_INET6);
-}
-
 static struct pernet_operations dccp_v6_ops = {
 	.init   = dccp_v6_init_net,
 	.exit   = dccp_v6_exit_net,
-	.exit_batch = dccp_v6_exit_batch,
 	.id	= &dccp_v6_pernet_id,
 	.size   = sizeof(struct dccp_v6_pernet),
 };

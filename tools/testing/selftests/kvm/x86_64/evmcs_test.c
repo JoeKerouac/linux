@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <linux/bitmap.h>
 
 #include "test_util.h"
 
@@ -22,15 +23,6 @@
 
 static int ud_count;
 
-void enable_x2apic(void)
-{
-	uint32_t spiv_reg = APIC_BASE_MSR + (APIC_SPIV >> 4);
-
-	wrmsr(MSR_IA32_APICBASE, rdmsr(MSR_IA32_APICBASE) |
-	      MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD);
-	wrmsr(spiv_reg, rdmsr(spiv_reg) | APIC_SPIV_APIC_ENABLED);
-}
-
 static void guest_ud_handler(struct ex_regs *regs)
 {
 	ud_count++;
@@ -39,6 +31,22 @@ static void guest_ud_handler(struct ex_regs *regs)
 
 static void guest_nmi_handler(struct ex_regs *regs)
 {
+}
+
+/* Exits to L1 destroy GRPs! */
+static inline void rdmsr_fs_base(void)
+{
+	__asm__ __volatile__ ("mov $0xc0000100, %%rcx; rdmsr" : : :
+			      "rax", "rbx", "rcx", "rdx",
+			      "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+			      "r13", "r14", "r15");
+}
+static inline void rdmsr_gs_base(void)
+{
+	__asm__ __volatile__ ("mov $0xc0000101, %%rcx; rdmsr" : : :
+			      "rax", "rbx", "rcx", "rdx",
+			      "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+			      "r13", "r14", "r15");
 }
 
 void l2_guest_code(void)
@@ -50,6 +58,15 @@ void l2_guest_code(void)
 	/* Forced exit to L1 upon restore */
 	GUEST_SYNC(9);
 
+	vmcall();
+
+	/* MSR-Bitmap tests */
+	rdmsr_fs_base(); /* intercepted */
+	rdmsr_fs_base(); /* intercepted */
+	rdmsr_gs_base(); /* not intercepted */
+	vmcall();
+	rdmsr_gs_base(); /* intercepted */
+
 	/* Done, exit to L1 and never come back.  */
 	vmcall();
 }
@@ -59,7 +76,7 @@ void guest_code(struct vmx_pages *vmx_pages)
 #define L2_GUEST_STACK_SIZE 64
 	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
 
-	enable_x2apic();
+	x2apic_enable();
 
 	GUEST_SYNC(1);
 	GUEST_SYNC(2);
@@ -85,8 +102,9 @@ void guest_code(struct vmx_pages *vmx_pages)
 	current_evmcs->revision_id = EVMCS_VERSION;
 	GUEST_SYNC(6);
 
-	current_evmcs->pin_based_vm_exec_control |=
-		PIN_BASED_NMI_EXITING;
+	vmwrite(PIN_BASED_VM_EXEC_CONTROL, vmreadz(PIN_BASED_VM_EXEC_CONTROL) |
+		PIN_BASED_NMI_EXITING);
+
 	GUEST_ASSERT(!vmlaunch());
 	GUEST_ASSERT(vmptrstz() == vmx_pages->enlightened_vmcs_gpa);
 
@@ -99,6 +117,39 @@ void guest_code(struct vmx_pages *vmx_pages)
 
 	GUEST_SYNC(10);
 
+	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_VMCALL);
+	current_evmcs->guest_rip += 3; /* vmcall */
+
+	/* Intercept RDMSR 0xc0000100 */
+	vmwrite(CPU_BASED_VM_EXEC_CONTROL, vmreadz(CPU_BASED_VM_EXEC_CONTROL) |
+		CPU_BASED_USE_MSR_BITMAPS);
+	set_bit(MSR_FS_BASE & 0x1fff, vmx_pages->msr + 0x400);
+	GUEST_ASSERT(!vmresume());
+	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_MSR_READ);
+	current_evmcs->guest_rip += 2; /* rdmsr */
+
+	/* Enable enlightened MSR bitmap */
+	current_evmcs->hv_enlightenments_control.msr_bitmap = 1;
+	GUEST_ASSERT(!vmresume());
+	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_MSR_READ);
+	current_evmcs->guest_rip += 2; /* rdmsr */
+
+	/* Intercept RDMSR 0xc0000101 without telling KVM about it */
+	set_bit(MSR_GS_BASE & 0x1fff, vmx_pages->msr + 0x400);
+	/* Make sure HV_VMX_ENLIGHTENED_CLEAN_FIELD_MSR_BITMAP is set */
+	current_evmcs->hv_clean_fields |= HV_VMX_ENLIGHTENED_CLEAN_FIELD_MSR_BITMAP;
+	GUEST_ASSERT(!vmresume());
+	/* Make sure we don't see EXIT_REASON_MSR_READ here so eMSR bitmap works */
+	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_VMCALL);
+	current_evmcs->guest_rip += 3; /* vmcall */
+
+	/* Now tell KVM we've changed MSR-Bitmap */
+	current_evmcs->hv_clean_fields &= ~HV_VMX_ENLIGHTENED_CLEAN_FIELD_MSR_BITMAP;
+	GUEST_ASSERT(!vmresume());
+	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_MSR_READ);
+	current_evmcs->guest_rip += 2; /* rdmsr */
+
+	GUEST_ASSERT(!vmresume());
 	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_VMCALL);
 	GUEST_SYNC(11);
 
@@ -121,14 +172,38 @@ void inject_nmi(struct kvm_vm *vm)
 	vcpu_events_set(vm, VCPU_ID, &events);
 }
 
+static void save_restore_vm(struct kvm_vm *vm)
+{
+	struct kvm_regs regs1, regs2;
+	struct kvm_x86_state *state;
+
+	state = vcpu_save_state(vm, VCPU_ID);
+	memset(&regs1, 0, sizeof(regs1));
+	vcpu_regs_get(vm, VCPU_ID, &regs1);
+
+	kvm_vm_release(vm);
+
+	/* Restore state in a new VM.  */
+	kvm_vm_restart(vm, O_RDWR);
+	vm_vcpu_add(vm, VCPU_ID);
+	vcpu_set_hv_cpuid(vm, VCPU_ID);
+	vcpu_enable_evmcs(vm, VCPU_ID);
+	vcpu_load_state(vm, VCPU_ID, state);
+	kvm_x86_state_cleanup(state);
+
+	memset(&regs2, 0, sizeof(regs2));
+	vcpu_regs_get(vm, VCPU_ID, &regs2);
+	TEST_ASSERT(!memcmp(&regs1, &regs2, sizeof(regs2)),
+		    "Unexpected register values after vcpu_load_state; rdi: %lx rsi: %lx",
+		    (ulong) regs2.rdi, (ulong) regs2.rsi);
+}
+
 int main(int argc, char *argv[])
 {
 	vm_vaddr_t vmx_pages_gva = 0;
 
-	struct kvm_regs regs1, regs2;
 	struct kvm_vm *vm;
 	struct kvm_run *run;
-	struct kvm_x86_state *state;
 	struct ucall uc;
 	int stage;
 
@@ -145,21 +220,18 @@ int main(int argc, char *argv[])
 	vcpu_set_hv_cpuid(vm, VCPU_ID);
 	vcpu_enable_evmcs(vm, VCPU_ID);
 
-	run = vcpu_state(vm, VCPU_ID);
-
-	vcpu_regs_get(vm, VCPU_ID, &regs1);
-
 	vcpu_alloc_vmx(vm, &vmx_pages_gva);
 	vcpu_args_set(vm, VCPU_ID, 1, vmx_pages_gva);
 
 	vm_init_descriptor_tables(vm);
 	vcpu_init_descriptor_tables(vm, VCPU_ID);
-	vm_handle_exception(vm, UD_VECTOR, guest_ud_handler);
-	vm_handle_exception(vm, NMI_VECTOR, guest_nmi_handler);
+	vm_install_exception_handler(vm, UD_VECTOR, guest_ud_handler);
+	vm_install_exception_handler(vm, NMI_VECTOR, guest_nmi_handler);
 
 	pr_info("Running L1 which uses EVMCS to run L2\n");
 
 	for (stage = 1;; stage++) {
+		run = vcpu_state(vm, VCPU_ID);
 		_vcpu_run(vm, VCPU_ID);
 		TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
 			    "Stage %d: unexpected exit reason: %u (%s),\n",
@@ -184,31 +256,22 @@ int main(int argc, char *argv[])
 			    uc.args[1] == stage, "Stage %d: Unexpected register values vmexit, got %lx",
 			    stage, (ulong)uc.args[1]);
 
-		state = vcpu_save_state(vm, VCPU_ID);
-		memset(&regs1, 0, sizeof(regs1));
-		vcpu_regs_get(vm, VCPU_ID, &regs1);
-
-		kvm_vm_release(vm);
-
-		/* Restore state in a new VM.  */
-		kvm_vm_restart(vm, O_RDWR);
-		vm_vcpu_add(vm, VCPU_ID);
-		vcpu_set_hv_cpuid(vm, VCPU_ID);
-		vcpu_enable_evmcs(vm, VCPU_ID);
-		vcpu_load_state(vm, VCPU_ID, state);
-		run = vcpu_state(vm, VCPU_ID);
-		free(state);
-
-		memset(&regs2, 0, sizeof(regs2));
-		vcpu_regs_get(vm, VCPU_ID, &regs2);
-		TEST_ASSERT(!memcmp(&regs1, &regs2, sizeof(regs2)),
-			    "Unexpected register values after vcpu_load_state; rdi: %lx rsi: %lx",
-			    (ulong) regs2.rdi, (ulong) regs2.rsi);
+		save_restore_vm(vm);
 
 		/* Force immediate L2->L1 exit before resuming */
 		if (stage == 8) {
 			pr_info("Injecting NMI into L1 before L2 had a chance to run after restore\n");
 			inject_nmi(vm);
+		}
+
+		/*
+		 * Do KVM_GET_NESTED_STATE/KVM_SET_NESTED_STATE for a freshly
+		 * restored VM (before the first KVM_RUN) to check that
+		 * KVM_STATE_NESTED_EVMCS is not lost.
+		 */
+		if (stage == 9) {
+			pr_info("Trying extra KVM_GET_NESTED_STATE/KVM_SET_NESTED_STATE cycle\n");
+			save_restore_vm(vm);
 		}
 	}
 

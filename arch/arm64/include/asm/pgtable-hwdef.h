@@ -72,13 +72,6 @@
 #define PTRS_PER_PGD		(1 << (VA_BITS - PGDIR_SHIFT))
 
 /*
- * Section address mask and size definitions.
- */
-#define SECTION_SHIFT		PMD_SHIFT
-#define SECTION_SIZE		(_AC(1, UL) << SECTION_SHIFT)
-#define SECTION_MASK		(~(SECTION_SIZE-1))
-
-/*
  * Contiguous page definitions.
  */
 #define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + PAGE_SHIFT)
@@ -280,6 +273,8 @@
 #define TCR_NFD1		(UL(1) << 54)
 #define TCR_E0PD0		(UL(1) << 55)
 #define TCR_E0PD1		(UL(1) << 56)
+#define TCR_TCMA0		(UL(1) << 57)
+#define TCR_TCMA1		(UL(1) << 58)
 
 /*
  * TTBR.

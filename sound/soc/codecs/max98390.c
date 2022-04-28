@@ -174,12 +174,12 @@ static int max98390_dai_set_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 
 	dev_dbg(component->dev, "%s: fmt 0x%08X\n", __func__, fmt);
 
-	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBS_CFS:
+	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_CBC_CFC:
 		mode = MAX98390_PCM_MASTER_MODE_SLAVE;
 		break;
-	case SND_SOC_DAIFMT_CBM_CFM:
-		max98390->master = true;
+	case SND_SOC_DAIFMT_CBP_CFP:
+		max98390->provider = true;
 		mode = MAX98390_PCM_MASTER_MODE_MASTER;
 		break;
 	default:
@@ -265,7 +265,7 @@ static int max98390_set_clock(struct snd_soc_component *component,
 		* snd_pcm_format_width(params_format(params));
 	int value;
 
-	if (max98390->master) {
+	if (max98390->provider) {
 		int i;
 		/* match rate to closest value */
 		for (i = 0; i < ARRAY_SIZE(rate_table); i++) {
@@ -765,17 +765,26 @@ static int max98390_dsm_init(struct snd_soc_component *component)
 	vendor = dmi_get_system_info(DMI_SYS_VENDOR);
 	product = dmi_get_system_info(DMI_PRODUCT_NAME);
 
-	if (vendor && product) {
-		snprintf(filename, sizeof(filename), "dsm_param_%s_%s.bin",
-			vendor, product);
+	if (!strcmp(max98390->dsm_param_name, "default")) {
+		if (vendor && product) {
+			snprintf(filename, sizeof(filename),
+				"dsm_param_%s_%s.bin", vendor, product);
+		} else {
+			sprintf(filename, "dsm_param.bin");
+		}
 	} else {
-		sprintf(filename, "dsm_param.bin");
+		snprintf(filename, sizeof(filename), "%s",
+			max98390->dsm_param_name);
 	}
 	ret = request_firmware(&fw, filename, component->dev);
 	if (ret) {
 		ret = request_firmware(&fw, "dsm_param.bin", component->dev);
-		if (ret)
-			goto err;
+		if (ret) {
+			ret = request_firmware(&fw, "dsmparam.bin",
+				component->dev);
+			if (ret)
+				goto err;
+		}
 	}
 
 	dev_dbg(component->dev,
@@ -1012,7 +1021,7 @@ static int max98390_i2c_probe(struct i2c_client *i2c,
 	int reg = 0;
 
 	struct max98390_priv *max98390 = NULL;
-	struct i2c_adapter *adapter = to_i2c_adapter(i2c->dev.parent);
+	struct i2c_adapter *adapter = i2c->adapter;
 
 	ret = i2c_check_functionality(adapter,
 		I2C_FUNC_SMBUS_BYTE
@@ -1046,6 +1055,11 @@ static int max98390_i2c_probe(struct i2c_client *i2c,
 		"%s: r0_calib: 0x%x,temperature_calib: 0x%x",
 		__func__, max98390->ref_rdc_value,
 		max98390->ambient_temp_value);
+
+	ret = device_property_read_string(&i2c->dev, "maxim,dsm_param_name",
+				       &max98390->dsm_param_name);
+	if (ret)
+		max98390->dsm_param_name = "default";
 
 	/* voltage/current slot configuration */
 	max98390_slot_config(i2c, max98390);

@@ -71,6 +71,8 @@ struct inet6_ifaddr {
 
 	bool			tokenized;
 
+	u8			ifa_proto;
+
 	struct rcu_head		rcu;
 	struct in6_addr		peer_addr;
 };
@@ -81,9 +83,6 @@ struct ip6_sf_socklist {
 	struct rcu_head		rcu;
 	struct in6_addr		sl_addr[];
 };
-
-#define IP6_SFLSIZE(count)	(sizeof(struct ip6_sf_socklist) + \
-	(count) * sizeof(struct in6_addr))
 
 #define IP6_SFBLOCK	10	/* allocate this many at once */
 
@@ -163,6 +162,7 @@ struct ipv6_devstat {
 
 struct inet6_dev {
 	struct net_device	*dev;
+	netdevice_tracker	dev_tracker;
 
 	struct list_head	addr_list;
 
@@ -213,6 +213,8 @@ struct inet6_dev {
 
 	unsigned long		tstamp; /* ipv6InterfaceTable update timestamp */
 	struct rcu_head		rcu;
+
+	unsigned int		ra_mtu;
 };
 
 static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)

@@ -10,7 +10,7 @@
 
 #include <linux/pci.h>
 
-#define HL_PLDM_PCI_ELBI_TIMEOUT_MSEC	(HL_PCI_ELBI_TIMEOUT_MSEC * 10)
+#define HL_PLDM_PCI_ELBI_TIMEOUT_MSEC	(HL_PCI_ELBI_TIMEOUT_MSEC * 100)
 
 #define IATU_REGION_CTRL_REGION_EN_MASK		BIT(31)
 #define IATU_REGION_CTRL_MATCH_MODE_MASK	BIT(30)
@@ -338,10 +338,7 @@ int hl_pci_set_outbound_region(struct hl_device *hdev,
 				lower_32_bits(outbound_region_end_address));
 	rc |= hl_pci_iatu_write(hdev, 0x014, 0);
 
-	if ((hdev->power9_64bit_dma_enable) && (hdev->dma_mask == 64))
-		rc |= hl_pci_iatu_write(hdev, 0x018, 0x08000000);
-	else
-		rc |= hl_pci_iatu_write(hdev, 0x018, 0);
+	rc |= hl_pci_iatu_write(hdev, 0x018, 0);
 
 	rc |= hl_pci_iatu_write(hdev, 0x020,
 				upper_32_bits(outbound_region_end_address));
@@ -357,6 +354,32 @@ int hl_pci_set_outbound_region(struct hl_device *hdev,
 	hl_pci_elbi_write(hdev, prop->pcie_aux_dbi_reg_addr, 0);
 
 	return rc;
+}
+
+/**
+ * hl_get_pci_memory_region() - get PCI region for given address
+ * @hdev: Pointer to hl_device structure.
+ * @addr: device address
+ *
+ * @return region index on success, otherwise PCI_REGION_NUMBER (invalid
+ *         region index)
+ */
+enum pci_region hl_get_pci_memory_region(struct hl_device *hdev, u64 addr)
+{
+	int i;
+
+	for  (i = 0 ; i < PCI_REGION_NUMBER ; i++) {
+		struct pci_mem_region *region = &hdev->pci_mem_region[i];
+
+		if (!region->used)
+			continue;
+
+		if ((addr >= region->region_base) &&
+			(addr < region->region_base + region->region_size))
+			return i;
+	}
+
+	return PCI_REGION_NUMBER;
 }
 
 /**
@@ -385,14 +408,20 @@ int hl_pci_init(struct hl_device *hdev)
 
 	rc = hdev->asic_funcs->pci_bars_map(hdev);
 	if (rc) {
-		dev_err(hdev->dev, "Failed to initialize PCI BARs\n");
+		dev_err(hdev->dev, "Failed to map PCI BAR addresses\n");
 		goto disable_device;
 	}
 
 	rc = hdev->asic_funcs->init_iatu(hdev);
 	if (rc) {
-		dev_err(hdev->dev, "Failed to initialize iATU\n");
+		dev_err(hdev->dev, "PCI controller was not initialized successfully\n");
 		goto unmap_pci_bars;
+	}
+
+	/* Driver must sleep in order for FW to finish the iATU configuration */
+	if (hdev->asic_prop.iatu_done_by_fw) {
+		usleep_range(2000, 3000);
+		hdev->asic_funcs->set_dma_mask_from_fw(hdev);
 	}
 
 	rc = dma_set_mask_and_coherent(&pdev->dev,
@@ -403,6 +432,8 @@ int hl_pci_init(struct hl_device *hdev)
 			hdev->dma_mask, rc);
 		goto unmap_pci_bars;
 	}
+
+	dma_set_max_seg_size(&pdev->dev, U32_MAX);
 
 	return 0;
 

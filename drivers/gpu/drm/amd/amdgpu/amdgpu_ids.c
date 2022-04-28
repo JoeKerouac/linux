@@ -112,7 +112,7 @@ void amdgpu_pasid_free_delayed(struct dma_resv *resv,
 	unsigned count;
 	int r;
 
-	r = dma_resv_get_fences_rcu(resv, NULL, &count, &fences);
+	r = dma_resv_get_fences(resv, true, &count, &fences);
 	if (r)
 		goto fallback;
 
@@ -156,8 +156,7 @@ fallback:
 	/* Not enough memory for the delayed delete, as last resort
 	 * block for all the fences to complete.
 	 */
-	dma_resv_wait_timeout_rcu(resv, true, false,
-					    MAX_SCHEDULE_TIMEOUT);
+	dma_resv_wait_timeout(resv, true, false, MAX_SCHEDULE_TIMEOUT);
 	amdgpu_pasid_free(pasid);
 }
 
@@ -183,7 +182,7 @@ bool amdgpu_vmid_had_gpu_reset(struct amdgpu_device *adev,
 }
 
 /**
- * amdgpu_vm_grab_idle - grab idle VMID
+ * amdgpu_vmid_grab_idle - grab idle VMID
  *
  * @vm: vm to allocate id for
  * @ring: ring we want to submit job to
@@ -205,7 +204,7 @@ static int amdgpu_vmid_grab_idle(struct amdgpu_vm *vm,
 	unsigned i;
 	int r;
 
-	if (ring->vmid_wait && !dma_fence_is_signaled(ring->vmid_wait))
+	if (!dma_fence_is_signaled(ring->vmid_wait))
 		return amdgpu_sync_fence(sync, ring->vmid_wait);
 
 	fences = kmalloc_array(id_mgr->num_ids, sizeof(void *), GFP_KERNEL);
@@ -256,7 +255,7 @@ static int amdgpu_vmid_grab_idle(struct amdgpu_vm *vm,
 }
 
 /**
- * amdgpu_vm_grab_reserved - try to assign reserved VMID
+ * amdgpu_vmid_grab_reserved - try to assign reserved VMID
  *
  * @vm: vm to allocate id for
  * @ring: ring we want to submit job to
@@ -325,7 +324,7 @@ static int amdgpu_vmid_grab_reserved(struct amdgpu_vm *vm,
 }
 
 /**
- * amdgpu_vm_grab_used - try to reuse a VMID
+ * amdgpu_vmid_grab_used - try to reuse a VMID
  *
  * @vm: vm to allocate id for
  * @ring: ring we want to submit job to
@@ -397,7 +396,7 @@ static int amdgpu_vmid_grab_used(struct amdgpu_vm *vm,
 }
 
 /**
- * amdgpu_vm_grab_id - allocate the next free VMID
+ * amdgpu_vmid_grab - allocate the next free VMID
  *
  * @vm: vm to allocate id for
  * @ring: ring we want to submit job to

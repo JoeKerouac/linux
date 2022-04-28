@@ -7,6 +7,7 @@
 #include "delalloc-space.h"
 #include "reflink.h"
 #include "transaction.h"
+#include "subpage.h"
 
 #define BTRFS_MAX_DEDUPE_LEN	SZ_16M
 
@@ -52,7 +53,8 @@ static int copy_inline_to_page(struct btrfs_inode *inode,
 			       const u64 datal,
 			       const u8 comp_type)
 {
-	const u64 block_size = btrfs_inode_sectorsize(inode);
+	struct btrfs_fs_info *fs_info = inode->root->fs_info;
+	const u32 block_size = fs_info->sectorsize;
 	const u64 range_end = file_offset + block_size - 1;
 	const size_t inline_size = size - btrfs_file_extent_calc_inline_size(0);
 	char *data_start = inline_data + btrfs_file_extent_calc_inline_size(0);
@@ -106,10 +108,12 @@ static int copy_inline_to_page(struct btrfs_inode *inode,
 	set_bit(BTRFS_INODE_NO_DELALLOC_FLUSH, &inode->runtime_flags);
 
 	if (comp_type == BTRFS_COMPRESS_NONE) {
-		memcpy_to_page(page, 0, data_start, datal);
+		memcpy_to_page(page, offset_in_page(file_offset), data_start,
+			       datal);
 		flush_dcache_page(page);
 	} else {
-		ret = btrfs_decompress(comp_type, data_start, page, 0,
+		ret = btrfs_decompress(comp_type, data_start, page,
+				       offset_in_page(file_offset),
 				       inline_size, datal);
 		if (ret)
 			goto out_unlock;
@@ -133,9 +137,9 @@ static int copy_inline_to_page(struct btrfs_inode *inode,
 		flush_dcache_page(page);
 	}
 
-	SetPageUptodate(page);
-	ClearPageChecked(page);
-	set_page_dirty(page);
+	btrfs_page_set_uptodate(fs_info, page, file_offset, block_size);
+	btrfs_page_clear_checked(fs_info, page, file_offset, block_size);
+	btrfs_page_set_dirty(fs_info, page, file_offset, block_size);
 out_unlock:
 	if (page) {
 		unlock_page(page);
@@ -203,10 +207,7 @@ static int clone_copy_inline_extent(struct inode *dst,
 			 * inline extent's data to the page.
 			 */
 			ASSERT(key.offset > 0);
-			ret = copy_inline_to_page(BTRFS_I(dst), new_key->offset,
-						  inline_data, size, datal,
-						  comp_type);
-			goto out;
+			goto copy_to_page;
 		}
 	} else if (i_size_read(dst) <= datal) {
 		struct btrfs_file_extent_item *ei;
@@ -222,13 +223,10 @@ static int clone_copy_inline_extent(struct inode *dst,
 		    BTRFS_FILE_EXTENT_INLINE)
 			goto copy_inline_extent;
 
-		ret = copy_inline_to_page(BTRFS_I(dst), new_key->offset,
-					  inline_data, size, datal, comp_type);
-		goto out;
+		goto copy_to_page;
 	}
 
 copy_inline_extent:
-	ret = 0;
 	/*
 	 * We have no extent items, or we have an extent at offset 0 which may
 	 * or may not be inlined. All these cases are dealt the same way.
@@ -240,11 +238,13 @@ copy_inline_extent:
 		 * clone. Deal with all these cases by copying the inline extent
 		 * data into the respective page at the destination inode.
 		 */
-		ret = copy_inline_to_page(BTRFS_I(dst), new_key->offset,
-					  inline_data, size, datal, comp_type);
-		goto out;
+		goto copy_to_page;
 	}
 
+	/*
+	 * Release path before starting a new transaction so we don't hold locks
+	 * that would confuse lockdep.
+	 */
 	btrfs_release_path(path);
 	/*
 	 * If we end up here it means were copy the inline extent into a leaf
@@ -277,7 +277,7 @@ copy_inline_extent:
 						  path->slots[0]),
 			    size);
 	btrfs_update_inode_bytes(BTRFS_I(dst), datal, drop_args.bytes_found);
-	set_bit(BTRFS_INODE_NEEDS_FULL_SYNC, &BTRFS_I(dst)->runtime_flags);
+	btrfs_set_inode_full_sync(BTRFS_I(dst));
 	ret = btrfs_inode_set_file_extent_range(BTRFS_I(dst), 0, aligned_end);
 out:
 	if (!ret && !trans) {
@@ -301,6 +301,21 @@ out:
 		*trans_out = trans;
 
 	return ret;
+
+copy_to_page:
+	/*
+	 * Release our path because we don't need it anymore and also because
+	 * copy_inline_to_page() needs to reserve data and metadata, which may
+	 * need to flush delalloc when we are low on available space and
+	 * therefore cause a deadlock if writeback of an inline extent needs to
+	 * write to the same leaf or an ordered extent completion needs to write
+	 * to the same leaf.
+	 */
+	btrfs_release_path(path);
+
+	ret = copy_inline_to_page(BTRFS_I(dst), new_key->offset,
+				  inline_data, size, datal, comp_type);
+	goto out;
 }
 
 /**
@@ -424,7 +439,7 @@ process_slot:
 			break;
 		}
 		next_key_min_offset = key.offset + datal;
-		size = btrfs_item_size_nr(leaf, slot);
+		size = btrfs_item_size(leaf, slot);
 		read_extent_buffer(leaf, buf, btrfs_item_ptr_offset(leaf, slot),
 				   size);
 
@@ -479,7 +494,8 @@ process_slot:
 					&clone_info, &trans);
 			if (ret)
 				goto out;
-		} else if (type == BTRFS_FILE_EXTENT_INLINE) {
+		} else {
+			ASSERT(type == BTRFS_FILE_EXTENT_INLINE);
 			/*
 			 * Inline extents always have to start at file offset 0
 			 * and can never be bigger then the sector size. We can
@@ -490,8 +506,12 @@ process_slot:
 			 */
 			ASSERT(key.offset == 0);
 			ASSERT(datal <= fs_info->sectorsize);
-			if (key.offset != 0 || datal > fs_info->sectorsize)
-				return -EUCLEAN;
+			if (WARN_ON(type != BTRFS_FILE_EXTENT_INLINE) ||
+			    WARN_ON(key.offset != 0) ||
+			    WARN_ON(datal > fs_info->sectorsize)) {
+				ret = -EUCLEAN;
+				goto out;
+			}
 
 			ret = clone_copy_inline_extent(inode, path, &new_key,
 						       drop_start, datal, size,
@@ -503,17 +523,22 @@ process_slot:
 		btrfs_release_path(path);
 
 		/*
-		 * If this is a new extent update the last_reflink_trans of both
-		 * inodes. This is used by fsync to make sure it does not log
-		 * multiple checksum items with overlapping ranges. For older
-		 * extents we don't need to do it since inode logging skips the
-		 * checksums for older extents. Also ignore holes and inline
-		 * extents because they don't have checksums in the csum tree.
+		 * Whenever we share an extent we update the last_reflink_trans
+		 * of each inode to the current transaction. This is needed to
+		 * make sure fsync does not log multiple checksum items with
+		 * overlapping ranges (because some extent items might refer
+		 * only to sections of the original extent). For the destination
+		 * inode we do this regardless of the generation of the extents
+		 * or even if they are inline extents or explicit holes, to make
+		 * sure a full fsync does not skip them. For the source inode,
+		 * we only need to update last_reflink_trans in case it's a new
+		 * extent that is not a hole or an inline extent, to deal with
+		 * the checksums problem on fsync.
 		 */
-		if (extent_gen == trans->transid && disko > 0) {
+		if (extent_gen == trans->transid && disko > 0)
 			BTRFS_I(src)->last_reflink_trans = trans->transid;
-			BTRFS_I(inode)->last_reflink_trans = trans->transid;
-		}
+
+		BTRFS_I(inode)->last_reflink_trans = trans->transid;
 
 		last_dest_end = ALIGN(new_key.offset + datal,
 				      fs_info->sectorsize);
@@ -560,8 +585,7 @@ process_slot:
 		 * replaced file extent items.
 		 */
 		if (last_dest_end >= i_size_read(inode))
-			set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
-				&BTRFS_I(inode)->runtime_flags);
+			btrfs_set_inode_full_sync(BTRFS_I(inode));
 
 		ret = btrfs_replace_file_extents(BTRFS_I(inode), path,
 				last_dest_end, destoff + len - 1, NULL, &trans);
@@ -621,7 +645,7 @@ static int btrfs_extent_same_range(struct inode *src, u64 loff, u64 len,
 	int ret;
 
 	/*
-	 * Lock destination range to serialize with concurrent readpages() and
+	 * Lock destination range to serialize with concurrent readahead() and
 	 * source range to serialize with relocation.
 	 */
 	btrfs_double_extent_lock(src, loff, dst, dst_loff, len);
@@ -634,7 +658,7 @@ static int btrfs_extent_same_range(struct inode *src, u64 loff, u64 len,
 static int btrfs_extent_same(struct inode *src, u64 loff, u64 olen,
 			     struct inode *dst, u64 dst_loff)
 {
-	int ret;
+	int ret = 0;
 	u64 i, tail_len, chunk_count;
 	struct btrfs_root *root_dst = BTRFS_I(dst)->root;
 
@@ -715,7 +739,7 @@ static noinline int btrfs_clone_files(struct file *file, struct file *file_src,
 	}
 
 	/*
-	 * Lock destination range to serialize with concurrent readpages() and
+	 * Lock destination range to serialize with concurrent readahead() and
 	 * source range to serialize with relocation.
 	 */
 	btrfs_double_extent_lock(src, off, inode, destoff, len);
@@ -757,9 +781,7 @@ static int btrfs_remap_file_range_prep(struct file *file_in, loff_t pos_in,
 		if (btrfs_root_readonly(root_out))
 			return -EROFS;
 
-		if (file_in->f_path.mnt != file_out->f_path.mnt ||
-		    inode_in->i_sb != inode_out->i_sb)
-			return -EXDEV;
+		ASSERT(inode_in->i_sb == inode_out->i_sb);
 	}
 
 	/* Don't make the dst file partly checksummed */

@@ -734,11 +734,11 @@ void kvmppc_rmap_reset(struct kvm *kvm)
 {
 	struct kvm_memslots *slots;
 	struct kvm_memory_slot *memslot;
-	int srcu_idx;
+	int srcu_idx, bkt;
 
 	srcu_idx = srcu_read_lock(&kvm->srcu);
 	slots = kvm_memslots(kvm);
-	kvm_for_each_memslot(memslot, slots) {
+	kvm_for_each_memslot(memslot, bkt, slots) {
 		/* Mutual exclusion with kvm_unmap_hva_range etc. */
 		spin_lock(&kvm->mmu_lock);
 		/*
@@ -840,7 +840,7 @@ bool kvm_unmap_gfn_range_hv(struct kvm *kvm, struct kvm_gfn_range *range)
 			kvm_unmap_radix(kvm, range->slot, gfn);
 	} else {
 		for (gfn = range->start; gfn < range->end; gfn++)
-			kvm_unmap_rmapp(kvm, range->slot, range->start);
+			kvm_unmap_rmapp(kvm, range->slot, gfn);
 	}
 
 	return false;
@@ -2112,7 +2112,7 @@ static const struct file_operations debugfs_htab_fops = {
 
 void kvmppc_mmu_debugfs_init(struct kvm *kvm)
 {
-	debugfs_create_file("htab", 0400, kvm->arch.debugfs_dir, kvm,
+	debugfs_create_file("htab", 0400, kvm->debugfs_dentry, kvm,
 			    &debugfs_htab_fops);
 }
 

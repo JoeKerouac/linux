@@ -114,6 +114,31 @@ unsigned long dev_pm_opp_get_voltage(struct dev_pm_opp *opp)
 EXPORT_SYMBOL_GPL(dev_pm_opp_get_voltage);
 
 /**
+ * dev_pm_opp_get_power() - Gets the power corresponding to an opp
+ * @opp:	opp for which power has to be returned for
+ *
+ * Return: power in micro watt corresponding to the opp, else
+ * return 0
+ *
+ * This is useful only for devices with single power supply.
+ */
+unsigned long dev_pm_opp_get_power(struct dev_pm_opp *opp)
+{
+	unsigned long opp_power = 0;
+	int i;
+
+	if (IS_ERR_OR_NULL(opp)) {
+		pr_err("%s: Invalid parameters\n", __func__);
+		return 0;
+	}
+	for (i = 0; i < opp->opp_table->regulator_count; i++)
+		opp_power += opp->supplies[i].u_watt;
+
+	return opp_power;
+}
+EXPORT_SYMBOL_GPL(dev_pm_opp_get_power);
+
+/**
  * dev_pm_opp_get_freq() - Gets the frequency corresponding to an available opp
  * @opp:	opp for which frequency has to be returned for
  *
@@ -896,6 +921,16 @@ static int _set_required_opps(struct device *dev,
 	/* required-opps not fully initialized yet */
 	if (lazy_linking_pending(opp_table))
 		return -EBUSY;
+
+	/*
+	 * We only support genpd's OPPs in the "required-opps" for now, as we
+	 * don't know much about other use cases. Error out if the required OPP
+	 * doesn't belong to a genpd.
+	 */
+	if (unlikely(!required_opp_tables[0]->is_genpd)) {
+		dev_err(dev, "required-opps don't belong to a genpd\n");
+		return -ENOENT;
+	}
 
 	/* Single genpd case */
 	if (!genpd_virt_devs)
@@ -1846,9 +1881,6 @@ void dev_pm_opp_put_supported_hw(struct opp_table *opp_table)
 	if (unlikely(!opp_table))
 		return;
 
-	/* Make sure there are no concurrent readers while updating opp_table */
-	WARN_ON(!list_empty(&opp_table->opp_list));
-
 	kfree(opp_table->supported_hw);
 	opp_table->supported_hw = NULL;
 	opp_table->supported_hw_count = 0;
@@ -1933,9 +1965,6 @@ void dev_pm_opp_put_prop_name(struct opp_table *opp_table)
 {
 	if (unlikely(!opp_table))
 		return;
-
-	/* Make sure there are no concurrent readers while updating opp_table */
-	WARN_ON(!list_empty(&opp_table->opp_list));
 
 	kfree(opp_table->prop_name);
 	opp_table->prop_name = NULL;
@@ -2045,9 +2074,6 @@ void dev_pm_opp_put_regulators(struct opp_table *opp_table)
 
 	if (!opp_table->regulators)
 		goto put_opp_table;
-
-	/* Make sure there are no concurrent readers while updating opp_table */
-	WARN_ON(!list_empty(&opp_table->opp_list));
 
 	if (opp_table->enabled) {
 		for (i = opp_table->regulator_count - 1; i >= 0; i--)
@@ -2168,9 +2194,6 @@ void dev_pm_opp_put_clkname(struct opp_table *opp_table)
 	if (unlikely(!opp_table))
 		return;
 
-	/* Make sure there are no concurrent readers while updating opp_table */
-	WARN_ON(!list_empty(&opp_table->opp_list));
-
 	clk_put(opp_table->clk);
 	opp_table->clk = ERR_PTR(-EINVAL);
 
@@ -2269,9 +2292,6 @@ void dev_pm_opp_unregister_set_opp_helper(struct opp_table *opp_table)
 	if (unlikely(!opp_table))
 		return;
 
-	/* Make sure there are no concurrent readers while updating opp_table */
-	WARN_ON(!list_empty(&opp_table->opp_list));
-
 	opp_table->set_opp = NULL;
 
 	mutex_lock(&opp_table->lock);
@@ -2353,12 +2373,12 @@ static void _opp_detach_genpd(struct opp_table *opp_table)
  * "required-opps" are added in DT.
  */
 struct opp_table *dev_pm_opp_attach_genpd(struct device *dev,
-		const char **names, struct device ***virt_devs)
+		const char * const *names, struct device ***virt_devs)
 {
 	struct opp_table *opp_table;
 	struct device *virt_dev;
 	int index = 0, ret = -EINVAL;
-	const char **name = names;
+	const char * const *name = names;
 
 	opp_table = _add_opp_table(dev, false);
 	if (IS_ERR(opp_table))
@@ -2462,7 +2482,7 @@ static void devm_pm_opp_detach_genpd(void *data)
  *
  * Return: 0 on success and errorno otherwise.
  */
-int devm_pm_opp_attach_genpd(struct device *dev, const char **names,
+int devm_pm_opp_attach_genpd(struct device *dev, const char * const *names,
 			     struct device ***virt_devs)
 {
 	struct opp_table *opp_table;

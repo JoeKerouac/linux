@@ -5,7 +5,6 @@
 #include <linux/sched.h>
 #include <linux/audit.h>
 #include <linux/randomize_kstack.h>
-#include <linux/tracehook.h>
 #include <linux/processor.h>
 #include <linux/uaccess.h>
 #include <asm/timex.h>
@@ -14,7 +13,6 @@
 #define ARCH_EXIT_TO_USER_MODE_WORK (_TIF_GUARDED_STORAGE | _TIF_PER_TRAP)
 
 void do_per_trap(struct pt_regs *regs);
-void do_syscall(struct pt_regs *regs);
 
 #ifdef CONFIG_DEBUG_ENTRY
 static __always_inline void arch_check_user_regs(struct pt_regs *regs)
@@ -60,7 +58,7 @@ static inline void arch_exit_to_user_mode_prepare(struct pt_regs *regs,
 
 static inline bool on_thread_stack(void)
 {
-	return !(((unsigned long)(current->stack) ^ current_stack_pointer()) & ~(THREAD_SIZE - 1));
+	return !(((unsigned long)(current->stack) ^ current_stack_pointer) & ~(THREAD_SIZE - 1));
 }
 
 #endif

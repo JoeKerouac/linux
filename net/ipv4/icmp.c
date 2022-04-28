@@ -192,24 +192,14 @@ struct icmp_control {
 
 static const struct icmp_control icmp_pointers[NR_ICMP_TYPES+1];
 
-/*
- *	The ICMP socket(s). This is the most convenient way to flow control
- *	our ICMP output as well as maintain a clean interface throughout
- *	all layers. All Socketless IP sends will soon be gone.
- *
- *	On SMP we have one ICMP socket per-cpu.
- */
-static struct sock *icmp_sk(struct net *net)
-{
-	return this_cpu_read(*net->ipv4.icmp_sk);
-}
+static DEFINE_PER_CPU(struct sock *, ipv4_icmp_sk);
 
 /* Called with BH disabled */
 static inline struct sock *icmp_xmit_lock(struct net *net)
 {
 	struct sock *sk;
 
-	sk = icmp_sk(net);
+	sk = this_cpu_read(ipv4_icmp_sk);
 
 	if (unlikely(!spin_trylock(&sk->sk_lock.slock))) {
 		/* This can happen if the output path signals a
@@ -217,11 +207,13 @@ static inline struct sock *icmp_xmit_lock(struct net *net)
 		 */
 		return NULL;
 	}
+	sock_net_set(sk, net);
 	return sk;
 }
 
 static inline void icmp_xmit_unlock(struct sock *sk)
 {
+	sock_net_set(sk, &init_net);
 	spin_unlock(&sk->sk_lock.slock);
 }
 
@@ -363,14 +355,13 @@ static int icmp_glue_bits(void *from, char *to, int offset, int len, int odd,
 	return 0;
 }
 
-static void icmp_push_reply(struct icmp_bxm *icmp_param,
+static void icmp_push_reply(struct sock *sk,
+			    struct icmp_bxm *icmp_param,
 			    struct flowi4 *fl4,
 			    struct ipcm_cookie *ipc, struct rtable **rt)
 {
-	struct sock *sk;
 	struct sk_buff *skb;
 
-	sk = icmp_sk(dev_net((*rt)->dst.dev));
 	if (ip_append_data(sk, fl4, icmp_glue_bits, icmp_param,
 			   icmp_param->data_len+icmp_param->head_len,
 			   icmp_param->head_len,
@@ -452,7 +443,7 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	if (IS_ERR(rt))
 		goto out_unlock;
 	if (icmpv4_xrlim_allow(net, rt, &fl4, type, code))
-		icmp_push_reply(icmp_param, &fl4, &ipc, &rt);
+		icmp_push_reply(sk, icmp_param, &fl4, &ipc, &rt);
 	ip_rt_put(rt);
 out_unlock:
 	icmp_xmit_unlock(sk);
@@ -759,7 +750,14 @@ void __icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info,
 		icmp_param.data_len = room;
 	icmp_param.head_len = sizeof(struct icmphdr);
 
-	icmp_push_reply(&icmp_param, &fl4, &ipc, &rt);
+	/* if we don't have a source address at this point, fall back to the
+	 * dummy address instead of sending out a packet with a source address
+	 * of 0.0.0.0
+	 */
+	if (!fl4.saddr)
+		fl4.saddr = htonl(INADDR_DUMMY);
+
+	icmp_push_reply(sk, &icmp_param, &fl4, &ipc, &rt);
 ende:
 	ip_rt_put(rt);
 out_unlock:
@@ -986,14 +984,8 @@ static bool icmp_redirect(struct sk_buff *skb)
 
 static bool icmp_echo(struct sk_buff *skb)
 {
-	struct icmp_ext_hdr *ext_hdr, _ext_hdr;
-	struct icmp_ext_echo_iio *iio, _iio;
 	struct icmp_bxm icmp_param;
-	struct net_device *dev;
-	char buff[IFNAMSIZ];
 	struct net *net;
-	u16 ident_len;
-	u8 status;
 
 	net = dev_net(skb_dst(skb)->dev);
 	/* should there be an ICMP stat for ignored echos? */
@@ -1006,20 +998,46 @@ static bool icmp_echo(struct sk_buff *skb)
 	icmp_param.data_len	   = skb->len;
 	icmp_param.head_len	   = sizeof(struct icmphdr);
 
-	if (icmp_param.data.icmph.type == ICMP_ECHO) {
+	if (icmp_param.data.icmph.type == ICMP_ECHO)
 		icmp_param.data.icmph.type = ICMP_ECHOREPLY;
-		goto send_reply;
-	}
-	if (!net->ipv4.sysctl_icmp_echo_enable_probe)
+	else if (!icmp_build_probe(skb, &icmp_param.data.icmph))
 		return true;
+
+	icmp_reply(&icmp_param, skb);
+	return true;
+}
+
+/*	Helper for icmp_echo and icmpv6_echo_reply.
+ *	Searches for net_device that matches PROBE interface identifier
+ *		and builds PROBE reply message in icmphdr.
+ *
+ *	Returns false if PROBE responses are disabled via sysctl
+ */
+
+bool icmp_build_probe(struct sk_buff *skb, struct icmphdr *icmphdr)
+{
+	struct icmp_ext_hdr *ext_hdr, _ext_hdr;
+	struct icmp_ext_echo_iio *iio, _iio;
+	struct net *net = dev_net(skb->dev);
+	struct net_device *dev;
+	char buff[IFNAMSIZ];
+	u16 ident_len;
+	u8 status;
+
+	if (!net->ipv4.sysctl_icmp_echo_enable_probe)
+		return false;
+
 	/* We currently only support probing interfaces on the proxy node
 	 * Check to ensure L-bit is set
 	 */
-	if (!(ntohs(icmp_param.data.icmph.un.echo.sequence) & 1))
-		return true;
+	if (!(ntohs(icmphdr->un.echo.sequence) & 1))
+		return false;
 	/* Clear status bits in reply message */
-	icmp_param.data.icmph.un.echo.sequence &= htons(0xFF00);
-	icmp_param.data.icmph.type = ICMP_EXT_ECHOREPLY;
+	icmphdr->un.echo.sequence &= htons(0xFF00);
+	if (icmphdr->type == ICMP_EXT_ECHO)
+		icmphdr->type = ICMP_EXT_ECHOREPLY;
+	else
+		icmphdr->type = ICMPV6_EXT_ECHO_REPLY;
 	ext_hdr = skb_header_pointer(skb, 0, sizeof(_ext_hdr), &_ext_hdr);
 	/* Size of iio is class_type dependent.
 	 * Only check header here and assign length based on ctype in the switch statement
@@ -1027,14 +1045,19 @@ static bool icmp_echo(struct sk_buff *skb)
 	iio = skb_header_pointer(skb, sizeof(_ext_hdr), sizeof(iio->extobj_hdr), &_iio);
 	if (!ext_hdr || !iio)
 		goto send_mal_query;
-	if (ntohs(iio->extobj_hdr.length) <= sizeof(iio->extobj_hdr))
+	if (ntohs(iio->extobj_hdr.length) <= sizeof(iio->extobj_hdr) ||
+	    ntohs(iio->extobj_hdr.length) > sizeof(_iio))
 		goto send_mal_query;
 	ident_len = ntohs(iio->extobj_hdr.length) - sizeof(iio->extobj_hdr);
+	iio = skb_header_pointer(skb, sizeof(_ext_hdr),
+				 sizeof(iio->extobj_hdr) + ident_len, &_iio);
+	if (!iio)
+		goto send_mal_query;
+
 	status = 0;
 	dev = NULL;
 	switch (iio->extobj_hdr.class_type) {
 	case ICMP_EXT_ECHO_CTYPE_NAME:
-		iio = skb_header_pointer(skb, sizeof(_ext_hdr), sizeof(_iio), &_iio);
 		if (ident_len >= IFNAMSIZ)
 			goto send_mal_query;
 		memset(buff, 0, sizeof(buff));
@@ -1042,34 +1065,27 @@ static bool icmp_echo(struct sk_buff *skb)
 		dev = dev_get_by_name(net, buff);
 		break;
 	case ICMP_EXT_ECHO_CTYPE_INDEX:
-		iio = skb_header_pointer(skb, sizeof(_ext_hdr), sizeof(iio->extobj_hdr) +
-					 sizeof(iio->ident.ifindex), &_iio);
 		if (ident_len != sizeof(iio->ident.ifindex))
 			goto send_mal_query;
 		dev = dev_get_by_index(net, ntohl(iio->ident.ifindex));
 		break;
 	case ICMP_EXT_ECHO_CTYPE_ADDR:
-		if (ident_len != sizeof(iio->ident.addr.ctype3_hdr) +
+		if (ident_len < sizeof(iio->ident.addr.ctype3_hdr) ||
+		    ident_len != sizeof(iio->ident.addr.ctype3_hdr) +
 				 iio->ident.addr.ctype3_hdr.addrlen)
 			goto send_mal_query;
 		switch (ntohs(iio->ident.addr.ctype3_hdr.afi)) {
 		case ICMP_AFI_IP:
-			iio = skb_header_pointer(skb, sizeof(_ext_hdr), sizeof(iio->extobj_hdr) +
-						 sizeof(struct in_addr), &_iio);
-			if (ident_len != sizeof(iio->ident.addr.ctype3_hdr) +
-					 sizeof(struct in_addr))
+			if (iio->ident.addr.ctype3_hdr.addrlen != sizeof(struct in_addr))
 				goto send_mal_query;
-			dev = ip_dev_find(net, iio->ident.addr.ip_addr.ipv4_addr.s_addr);
+			dev = ip_dev_find(net, iio->ident.addr.ip_addr.ipv4_addr);
 			break;
 #if IS_ENABLED(CONFIG_IPV6)
 		case ICMP_AFI_IP6:
-			iio = skb_header_pointer(skb, sizeof(_ext_hdr), sizeof(_iio), &_iio);
-			if (ident_len != sizeof(iio->ident.addr.ctype3_hdr) +
-					 sizeof(struct in6_addr))
+			if (iio->ident.addr.ctype3_hdr.addrlen != sizeof(struct in6_addr))
 				goto send_mal_query;
 			dev = ipv6_stub->ipv6_dev_find(net, &iio->ident.addr.ip_addr.ipv6_addr, dev);
-			if (dev)
-				dev_hold(dev);
+			dev_hold(dev);
 			break;
 #endif
 		default:
@@ -1080,8 +1096,8 @@ static bool icmp_echo(struct sk_buff *skb)
 		goto send_mal_query;
 	}
 	if (!dev) {
-		icmp_param.data.icmph.code = ICMP_EXT_CODE_NO_IF;
-		goto send_reply;
+		icmphdr->code = ICMP_EXT_CODE_NO_IF;
+		return true;
 	}
 	/* Fill bits in reply message */
 	if (dev->flags & IFF_UP)
@@ -1091,14 +1107,13 @@ static bool icmp_echo(struct sk_buff *skb)
 	if (!list_empty(&rcu_dereference(dev->ip6_ptr)->addr_list))
 		status |= ICMP_EXT_ECHOREPLY_IPV6;
 	dev_put(dev);
-	icmp_param.data.icmph.un.echo.sequence |= htons(status);
-send_reply:
-	icmp_reply(&icmp_param, skb);
-		return true;
+	icmphdr->un.echo.sequence |= htons(status);
+	return true;
 send_mal_query:
-	icmp_param.data.icmph.code = ICMP_EXT_CODE_MAL_QUERY;
-	goto send_reply;
+	icmphdr->code = ICMP_EXT_CODE_MAL_QUERY;
+	return true;
 }
+EXPORT_SYMBOL_GPL(icmp_build_probe);
 
 /*
  *	Handle ICMP Timestamp requests.
@@ -1410,46 +1425,8 @@ static const struct icmp_control icmp_pointers[NR_ICMP_TYPES + 1] = {
 	},
 };
 
-static void __net_exit icmp_sk_exit(struct net *net)
-{
-	int i;
-
-	for_each_possible_cpu(i)
-		inet_ctl_sock_destroy(*per_cpu_ptr(net->ipv4.icmp_sk, i));
-	free_percpu(net->ipv4.icmp_sk);
-	net->ipv4.icmp_sk = NULL;
-}
-
 static int __net_init icmp_sk_init(struct net *net)
 {
-	int i, err;
-
-	net->ipv4.icmp_sk = alloc_percpu(struct sock *);
-	if (!net->ipv4.icmp_sk)
-		return -ENOMEM;
-
-	for_each_possible_cpu(i) {
-		struct sock *sk;
-
-		err = inet_ctl_sock_create(&sk, PF_INET,
-					   SOCK_RAW, IPPROTO_ICMP, net);
-		if (err < 0)
-			goto fail;
-
-		*per_cpu_ptr(net->ipv4.icmp_sk, i) = sk;
-
-		/* Enough space for 2 64K ICMP packets, including
-		 * sk_buff/skb_shared_info struct overhead.
-		 */
-		sk->sk_sndbuf =	2 * SKB_TRUESIZE(64 * 1024);
-
-		/*
-		 * Speedup sock_wfree()
-		 */
-		sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
-		inet_sk(sk)->pmtudisc = IP_PMTUDISC_DONT;
-	}
-
 	/* Control parameters for ECHO replies. */
 	net->ipv4.sysctl_icmp_echo_ignore_all = 0;
 	net->ipv4.sysctl_icmp_echo_enable_probe = 0;
@@ -1475,18 +1452,36 @@ static int __net_init icmp_sk_init(struct net *net)
 	net->ipv4.sysctl_icmp_errors_use_inbound_ifaddr = 0;
 
 	return 0;
-
-fail:
-	icmp_sk_exit(net);
-	return err;
 }
 
 static struct pernet_operations __net_initdata icmp_sk_ops = {
        .init = icmp_sk_init,
-       .exit = icmp_sk_exit,
 };
 
 int __init icmp_init(void)
 {
+	int err, i;
+
+	for_each_possible_cpu(i) {
+		struct sock *sk;
+
+		err = inet_ctl_sock_create(&sk, PF_INET,
+					   SOCK_RAW, IPPROTO_ICMP, &init_net);
+		if (err < 0)
+			return err;
+
+		per_cpu(ipv4_icmp_sk, i) = sk;
+
+		/* Enough space for 2 64K ICMP packets, including
+		 * sk_buff/skb_shared_info struct overhead.
+		 */
+		sk->sk_sndbuf =	2 * SKB_TRUESIZE(64 * 1024);
+
+		/*
+		 * Speedup sock_wfree()
+		 */
+		sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
+		inet_sk(sk)->pmtudisc = IP_PMTUDISC_DONT;
+	}
 	return register_pernet_subsys(&icmp_sk_ops);
 }

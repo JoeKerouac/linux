@@ -17,6 +17,7 @@
 #include <uapi/linux/btf.h>
 #include <linux/btf_ids.h>
 #include <linux/fdtable.h>
+#include <linux/rcupdate_trace.h>
 
 DEFINE_BPF_STORAGE_CACHE(task_cache);
 
@@ -59,7 +60,8 @@ task_storage_lookup(struct task_struct *task, struct bpf_map *map,
 	struct bpf_local_storage *task_storage;
 	struct bpf_local_storage_map *smap;
 
-	task_storage = rcu_dereference(task->bpf_storage);
+	task_storage =
+		rcu_dereference_check(task->bpf_storage, bpf_rcu_lock_held());
 	if (!task_storage)
 		return NULL;
 
@@ -172,7 +174,8 @@ static int bpf_pid_task_storage_update_elem(struct bpf_map *map, void *key,
 
 	bpf_task_storage_lock();
 	sdata = bpf_local_storage_update(
-		task, (struct bpf_local_storage_map *)map, value, map_flags);
+		task, (struct bpf_local_storage_map *)map, value, map_flags,
+		GFP_ATOMIC);
 	bpf_task_storage_unlock();
 
 	err = PTR_ERR_OR_ZERO(sdata);
@@ -224,11 +227,13 @@ out:
 	return err;
 }
 
-BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
-	   task, void *, value, u64, flags)
+/* *gfp_flags* is a hidden argument provided by the verifier */
+BPF_CALL_5(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
+	   task, void *, value, u64, flags, gfp_t, gfp_flags)
 {
 	struct bpf_local_storage_data *sdata;
 
+	WARN_ON_ONCE(!bpf_rcu_lock_held());
 	if (flags & ~(BPF_LOCAL_STORAGE_GET_F_CREATE))
 		return (unsigned long)NULL;
 
@@ -247,7 +252,7 @@ BPF_CALL_4(bpf_task_storage_get, struct bpf_map *, map, struct task_struct *,
 	    (flags & BPF_LOCAL_STORAGE_GET_F_CREATE))
 		sdata = bpf_local_storage_update(
 			task, (struct bpf_local_storage_map *)map, value,
-			BPF_NOEXIST);
+			BPF_NOEXIST, gfp_flags);
 
 unlock:
 	bpf_task_storage_unlock();
@@ -260,6 +265,7 @@ BPF_CALL_2(bpf_task_storage_delete, struct bpf_map *, map, struct task_struct *,
 {
 	int ret;
 
+	WARN_ON_ONCE(!bpf_rcu_lock_held());
 	if (!task)
 		return -EINVAL;
 
@@ -317,15 +323,13 @@ const struct bpf_map_ops task_storage_map_ops = {
 	.map_owner_storage_ptr = task_storage_ptr,
 };
 
-BTF_ID_LIST_SINGLE(bpf_task_storage_btf_ids, struct, task_struct)
-
 const struct bpf_func_proto bpf_task_storage_get_proto = {
 	.func = bpf_task_storage_get,
 	.gpl_only = false,
 	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
 	.arg1_type = ARG_CONST_MAP_PTR,
 	.arg2_type = ARG_PTR_TO_BTF_ID,
-	.arg2_btf_id = &bpf_task_storage_btf_ids[0],
+	.arg2_btf_id = &btf_tracing_ids[BTF_TRACING_TYPE_TASK],
 	.arg3_type = ARG_PTR_TO_MAP_VALUE_OR_NULL,
 	.arg4_type = ARG_ANYTHING,
 };
@@ -336,5 +340,5 @@ const struct bpf_func_proto bpf_task_storage_delete_proto = {
 	.ret_type = RET_INTEGER,
 	.arg1_type = ARG_CONST_MAP_PTR,
 	.arg2_type = ARG_PTR_TO_BTF_ID,
-	.arg2_btf_id = &bpf_task_storage_btf_ids[0],
+	.arg2_btf_id = &btf_tracing_ids[BTF_TRACING_TYPE_TASK],
 };

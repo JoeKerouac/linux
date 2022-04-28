@@ -2049,6 +2049,13 @@ static SOC_ENUM_SINGLE_DECL(hpoutl_enum,
 static const struct snd_kcontrol_new hpoutl_mux =
 	SOC_DAPM_ENUM("HPOUTL Mux", hpoutl_enum);
 
+static const char * const input_mode_text[] = { "Analog", "Digital" };
+
+static SOC_ENUM_SINGLE_VIRT_DECL(input_mode_enum, input_mode_text);
+
+static const struct snd_kcontrol_new input_mode_mux =
+	SOC_DAPM_ENUM("Input Mode", input_mode_enum);
+
 static const struct snd_kcontrol_new inpgal[] = {
 SOC_DAPM_SINGLE("IN1L Switch", WM8962_LEFT_INPUT_PGA_CONTROL, 3, 1, 0),
 SOC_DAPM_SINGLE("IN2L Switch", WM8962_LEFT_INPUT_PGA_CONTROL, 2, 1, 0),
@@ -2147,6 +2154,9 @@ SND_SOC_DAPM_MIXER("MIXINR", WM8962_PWR_MGMT_1, 4, 0,
 
 SND_SOC_DAPM_AIF_IN("DMIC_ENA", NULL, 0, WM8962_PWR_MGMT_1, 10, 0),
 
+SND_SOC_DAPM_MUX("Input Mode L", SND_SOC_NOPM, 0, 0, &input_mode_mux),
+SND_SOC_DAPM_MUX("Input Mode R", SND_SOC_NOPM, 0, 0, &input_mode_mux),
+
 SND_SOC_DAPM_ADC("ADCL", "Capture", WM8962_PWR_MGMT_1, 3, 0),
 SND_SOC_DAPM_ADC("ADCR", "Capture", WM8962_PWR_MGMT_1, 2, 0),
 
@@ -2226,16 +2236,19 @@ static const struct snd_soc_dapm_route wm8962_intercon[] = {
 
 	{ "DMIC_ENA", NULL, "DMICDAT" },
 
+	{ "Input Mode L", "Analog", "MIXINL" },
+	{ "Input Mode L", "Digital", "DMIC_ENA" },
+	{ "Input Mode R", "Analog", "MIXINR" },
+	{ "Input Mode R", "Digital", "DMIC_ENA" },
+
 	{ "ADCL", NULL, "SYSCLK" },
 	{ "ADCL", NULL, "TOCLK" },
-	{ "ADCL", NULL, "MIXINL" },
-	{ "ADCL", NULL, "DMIC_ENA" },
+	{ "ADCL", NULL, "Input Mode L" },
 	{ "ADCL", NULL, "DSP2" },
 
 	{ "ADCR", NULL, "SYSCLK" },
 	{ "ADCR", NULL, "TOCLK" },
-	{ "ADCR", NULL, "MIXINR" },
-	{ "ADCR", NULL, "DMIC_ENA" },
+	{ "ADCR", NULL, "Input Mode R" },
 	{ "ADCR", NULL, "DSP2" },
 
 	{ "STL", "Left", "ADCL" },
@@ -3219,9 +3232,8 @@ static int wm8962_beep_event(struct input_dev *dev, unsigned int type,
 	return 0;
 }
 
-static ssize_t wm8962_beep_set(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
+static ssize_t beep_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
 {
 	struct wm8962_priv *wm8962 = dev_get_drvdata(dev);
 	long int time;
@@ -3236,7 +3248,7 @@ static ssize_t wm8962_beep_set(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(beep, 0200, NULL, wm8962_beep_set);
+static DEVICE_ATTR_WO(beep);
 
 static void wm8962_init_beep(struct snd_soc_component *component)
 {
@@ -3539,9 +3551,8 @@ static int wm8962_set_pdata_from_of(struct i2c_client *i2c,
 				pdata->gpio_init[i] = 0x0;
 		}
 
-	pdata->mclk = devm_clk_get(&i2c->dev, NULL);
-
-	return 0;
+	pdata->mclk = devm_clk_get_optional(&i2c->dev, NULL);
+	return PTR_ERR_OR_ZERO(pdata->mclk);
 }
 
 static int wm8962_i2c_probe(struct i2c_client *i2c,
@@ -3571,14 +3582,6 @@ static int wm8962_i2c_probe(struct i2c_client *i2c,
 		ret = wm8962_set_pdata_from_of(i2c, &wm8962->pdata);
 		if (ret != 0)
 			return ret;
-	}
-
-	/* Mark the mclk pointer to NULL if no mclk assigned */
-	if (IS_ERR(wm8962->pdata.mclk)) {
-		/* But do not ignore the request for probe defer */
-		if (PTR_ERR(wm8962->pdata.mclk) == -EPROBE_DEFER)
-			return -EPROBE_DEFER;
-		wm8962->pdata.mclk = NULL;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(wm8962->supplies); i++)
