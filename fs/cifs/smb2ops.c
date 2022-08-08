@@ -126,13 +126,13 @@ smb2_add_credits(struct TCP_Server_Info *server,
 			 optype, scredits, add);
 	}
 
-	spin_lock(&cifs_tcp_ses_lock);
+	spin_lock(&server->srv_lock);
 	if (server->tcpStatus == CifsNeedReconnect
 	    || server->tcpStatus == CifsExiting) {
-		spin_unlock(&cifs_tcp_ses_lock);
+		spin_unlock(&server->srv_lock);
 		return;
 	}
-	spin_unlock(&cifs_tcp_ses_lock);
+	spin_unlock(&server->srv_lock);
 
 	switch (rc) {
 	case -1:
@@ -218,12 +218,12 @@ smb2_wait_mtu_credits(struct TCP_Server_Info *server, unsigned int size,
 			spin_lock(&server->req_lock);
 		} else {
 			spin_unlock(&server->req_lock);
-			spin_lock(&cifs_tcp_ses_lock);
+			spin_lock(&server->srv_lock);
 			if (server->tcpStatus == CifsExiting) {
-				spin_unlock(&cifs_tcp_ses_lock);
+				spin_unlock(&server->srv_lock);
 				return -ENOENT;
 			}
-			spin_unlock(&cifs_tcp_ses_lock);
+			spin_unlock(&server->srv_lock);
 
 			spin_lock(&server->req_lock);
 			scredits = server->credits;
@@ -319,19 +319,19 @@ smb2_get_next_mid(struct TCP_Server_Info *server)
 {
 	__u64 mid;
 	/* for SMB2 we need the current value */
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	mid = server->CurrentMid++;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	return mid;
 }
 
 static void
 smb2_revert_current_mid(struct TCP_Server_Info *server, const unsigned int val)
 {
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	if (server->CurrentMid >= val)
 		server->CurrentMid -= val;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 }
 
 static struct mid_q_entry *
@@ -346,7 +346,7 @@ __smb2_find_mid(struct TCP_Server_Info *server, char *buf, bool dequeue)
 		return NULL;
 	}
 
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	list_for_each_entry(mid, &server->pending_mid_q, qhead) {
 		if ((mid->mid == wire_mid) &&
 		    (mid->mid_state == MID_REQUEST_SUBMITTED) &&
@@ -356,11 +356,11 @@ __smb2_find_mid(struct TCP_Server_Info *server, char *buf, bool dequeue)
 				list_del_init(&mid->qhead);
 				mid->mid_flags |= MID_DELETED;
 			}
-			spin_unlock(&GlobalMid_Lock);
+			spin_unlock(&server->mid_lock);
 			return mid;
 		}
 	}
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	return NULL;
 }
 
@@ -403,9 +403,9 @@ smb2_negotiate(const unsigned int xid,
 {
 	int rc;
 
-	spin_lock(&GlobalMid_Lock);
+	spin_lock(&server->mid_lock);
 	server->CurrentMid = 0;
-	spin_unlock(&GlobalMid_Lock);
+	spin_unlock(&server->mid_lock);
 	rc = SMB2_negotiate(xid, ses, server);
 	/* BB we probably don't need to retry with modern servers */
 	if (rc == -EAGAIN)
@@ -512,30 +512,135 @@ smb3_negotiate_rsize(struct cifs_tcon *tcon, struct smb3_fs_context *ctx)
 static int
 parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 			size_t buf_len,
-			struct cifs_server_iface **iface_list,
-			size_t *iface_count)
+			struct cifs_ses *ses)
 {
 	struct network_interface_info_ioctl_rsp *p;
 	struct sockaddr_in *addr4;
 	struct sockaddr_in6 *addr6;
 	struct iface_info_ipv4 *p4;
 	struct iface_info_ipv6 *p6;
-	struct cifs_server_iface *info;
+	struct cifs_server_iface *info = NULL, *iface = NULL, *niface = NULL;
+	struct cifs_server_iface tmp_iface;
 	ssize_t bytes_left;
 	size_t next = 0;
 	int nb_iface = 0;
-	int rc = 0;
-
-	*iface_list = NULL;
-	*iface_count = 0;
-
-	/*
-	 * Fist pass: count and sanity check
-	 */
+	int rc = 0, ret = 0;
 
 	bytes_left = buf_len;
 	p = buf;
+
+	spin_lock(&ses->iface_lock);
+	/*
+	 * Go through iface_list and do kref_put to remove
+	 * any unused ifaces. ifaces in use will be removed
+	 * when the last user calls a kref_put on it
+	 */
+	list_for_each_entry_safe(iface, niface, &ses->iface_list,
+				 iface_head) {
+		iface->is_active = 0;
+		kref_put(&iface->refcount, release_iface);
+	}
+	spin_unlock(&ses->iface_lock);
+
 	while (bytes_left >= sizeof(*p)) {
+		memset(&tmp_iface, 0, sizeof(tmp_iface));
+		tmp_iface.speed = le64_to_cpu(p->LinkSpeed);
+		tmp_iface.rdma_capable = le32_to_cpu(p->Capability & RDMA_CAPABLE) ? 1 : 0;
+		tmp_iface.rss_capable = le32_to_cpu(p->Capability & RSS_CAPABLE) ? 1 : 0;
+
+		switch (p->Family) {
+		/*
+		 * The kernel and wire socket structures have the same
+		 * layout and use network byte order but make the
+		 * conversion explicit in case either one changes.
+		 */
+		case INTERNETWORK:
+			addr4 = (struct sockaddr_in *)&tmp_iface.sockaddr;
+			p4 = (struct iface_info_ipv4 *)p->Buffer;
+			addr4->sin_family = AF_INET;
+			memcpy(&addr4->sin_addr, &p4->IPv4Address, 4);
+
+			/* [MS-SMB2] 2.2.32.5.1.1 Clients MUST ignore these */
+			addr4->sin_port = cpu_to_be16(CIFS_PORT);
+
+			cifs_dbg(FYI, "%s: ipv4 %pI4\n", __func__,
+				 &addr4->sin_addr);
+			break;
+		case INTERNETWORKV6:
+			addr6 =	(struct sockaddr_in6 *)&tmp_iface.sockaddr;
+			p6 = (struct iface_info_ipv6 *)p->Buffer;
+			addr6->sin6_family = AF_INET6;
+			memcpy(&addr6->sin6_addr, &p6->IPv6Address, 16);
+
+			/* [MS-SMB2] 2.2.32.5.1.2 Clients MUST ignore these */
+			addr6->sin6_flowinfo = 0;
+			addr6->sin6_scope_id = 0;
+			addr6->sin6_port = cpu_to_be16(CIFS_PORT);
+
+			cifs_dbg(FYI, "%s: ipv6 %pI6\n", __func__,
+				 &addr6->sin6_addr);
+			break;
+		default:
+			cifs_dbg(VFS,
+				 "%s: skipping unsupported socket family\n",
+				 __func__);
+			goto next_iface;
+		}
+
+		/*
+		 * The iface_list is assumed to be sorted by speed.
+		 * Check if the new interface exists in that list.
+		 * NEVER change iface. it could be in use.
+		 * Add a new one instead
+		 */
+		spin_lock(&ses->iface_lock);
+		iface = niface = NULL;
+		list_for_each_entry_safe(iface, niface, &ses->iface_list,
+					 iface_head) {
+			ret = iface_cmp(iface, &tmp_iface);
+			if (!ret) {
+				/* just get a ref so that it doesn't get picked/freed */
+				iface->is_active = 1;
+				kref_get(&iface->refcount);
+				spin_unlock(&ses->iface_lock);
+				goto next_iface;
+			} else if (ret < 0) {
+				/* all remaining ifaces are slower */
+				kref_get(&iface->refcount);
+				break;
+			}
+		}
+		spin_unlock(&ses->iface_lock);
+
+		/* no match. insert the entry in the list */
+		info = kmalloc(sizeof(struct cifs_server_iface),
+			       GFP_KERNEL);
+		if (!info) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		memcpy(info, &tmp_iface, sizeof(tmp_iface));
+
+		/* add this new entry to the list */
+		kref_init(&info->refcount);
+		info->is_active = 1;
+
+		cifs_dbg(FYI, "%s: adding iface %zu\n", __func__, ses->iface_count);
+		cifs_dbg(FYI, "%s: speed %zu bps\n", __func__, info->speed);
+		cifs_dbg(FYI, "%s: capabilities 0x%08x\n", __func__,
+			 le32_to_cpu(p->Capability));
+
+		spin_lock(&ses->iface_lock);
+		if (!list_entry_is_head(iface, &ses->iface_list, iface_head)) {
+			list_add_tail(&info->iface_head, &iface->iface_head);
+			kref_put(&iface->refcount, release_iface);
+		} else
+			list_add_tail(&info->iface_head, &ses->iface_list);
+		spin_unlock(&ses->iface_lock);
+
+		ses->iface_count++;
+		ses->iface_last_update = jiffies;
+next_iface:
 		nb_iface++;
 		next = le32_to_cpu(p->Next);
 		if (!next) {
@@ -557,108 +662,21 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 		cifs_dbg(VFS, "%s: incomplete interface info\n", __func__);
 
 
-	/*
-	 * Second pass: extract info to internal structure
-	 */
-
-	*iface_list = kcalloc(nb_iface, sizeof(**iface_list), GFP_KERNEL);
-	if (!*iface_list) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	info = *iface_list;
-	bytes_left = buf_len;
-	p = buf;
-	while (bytes_left >= sizeof(*p)) {
-		info->speed = le64_to_cpu(p->LinkSpeed);
-		info->rdma_capable = le32_to_cpu(p->Capability & RDMA_CAPABLE) ? 1 : 0;
-		info->rss_capable = le32_to_cpu(p->Capability & RSS_CAPABLE) ? 1 : 0;
-
-		cifs_dbg(FYI, "%s: adding iface %zu\n", __func__, *iface_count);
-		cifs_dbg(FYI, "%s: speed %zu bps\n", __func__, info->speed);
-		cifs_dbg(FYI, "%s: capabilities 0x%08x\n", __func__,
-			 le32_to_cpu(p->Capability));
-
-		switch (p->Family) {
-		/*
-		 * The kernel and wire socket structures have the same
-		 * layout and use network byte order but make the
-		 * conversion explicit in case either one changes.
-		 */
-		case INTERNETWORK:
-			addr4 = (struct sockaddr_in *)&info->sockaddr;
-			p4 = (struct iface_info_ipv4 *)p->Buffer;
-			addr4->sin_family = AF_INET;
-			memcpy(&addr4->sin_addr, &p4->IPv4Address, 4);
-
-			/* [MS-SMB2] 2.2.32.5.1.1 Clients MUST ignore these */
-			addr4->sin_port = cpu_to_be16(CIFS_PORT);
-
-			cifs_dbg(FYI, "%s: ipv4 %pI4\n", __func__,
-				 &addr4->sin_addr);
-			break;
-		case INTERNETWORKV6:
-			addr6 =	(struct sockaddr_in6 *)&info->sockaddr;
-			p6 = (struct iface_info_ipv6 *)p->Buffer;
-			addr6->sin6_family = AF_INET6;
-			memcpy(&addr6->sin6_addr, &p6->IPv6Address, 16);
-
-			/* [MS-SMB2] 2.2.32.5.1.2 Clients MUST ignore these */
-			addr6->sin6_flowinfo = 0;
-			addr6->sin6_scope_id = 0;
-			addr6->sin6_port = cpu_to_be16(CIFS_PORT);
-
-			cifs_dbg(FYI, "%s: ipv6 %pI6\n", __func__,
-				 &addr6->sin6_addr);
-			break;
-		default:
-			cifs_dbg(VFS,
-				 "%s: skipping unsupported socket family\n",
-				 __func__);
-			goto next_iface;
-		}
-
-		(*iface_count)++;
-		info++;
-next_iface:
-		next = le32_to_cpu(p->Next);
-		if (!next)
-			break;
-		p = (struct network_interface_info_ioctl_rsp *)((u8 *)p+next);
-		bytes_left -= next;
-	}
-
-	if (!*iface_count) {
+	if (!ses->iface_count) {
 		rc = -EINVAL;
 		goto out;
 	}
 
 out:
-	if (rc) {
-		kfree(*iface_list);
-		*iface_count = 0;
-		*iface_list = NULL;
-	}
 	return rc;
 }
 
-static int compare_iface(const void *ia, const void *ib)
-{
-	const struct cifs_server_iface *a = (struct cifs_server_iface *)ia;
-	const struct cifs_server_iface *b = (struct cifs_server_iface *)ib;
-
-	return a->speed == b->speed ? 0 : (a->speed > b->speed ? -1 : 1);
-}
-
-static int
+int
 SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon)
 {
 	int rc;
 	unsigned int ret_data_len = 0;
 	struct network_interface_info_ioctl_rsp *out_buf = NULL;
-	struct cifs_server_iface *iface_list;
-	size_t iface_count;
 	struct cifs_ses *ses = tcon->ses;
 
 	rc = SMB2_ioctl(xid, tcon, NO_FILE_ID, NO_FILE_ID,
@@ -674,20 +692,9 @@ SMB3_request_interfaces(const unsigned int xid, struct cifs_tcon *tcon)
 		goto out;
 	}
 
-	rc = parse_server_interfaces(out_buf, ret_data_len,
-				     &iface_list, &iface_count);
+	rc = parse_server_interfaces(out_buf, ret_data_len, ses);
 	if (rc)
 		goto out;
-
-	/* sort interfaces from fastest to slowest */
-	sort(iface_list, iface_count, sizeof(*iface_list), compare_iface, NULL);
-
-	spin_lock(&ses->iface_lock);
-	kfree(ses->iface_list);
-	ses->iface_list = iface_list;
-	ses->iface_count = iface_count;
-	ses->iface_last_update = jiffies;
-	spin_unlock(&ses->iface_lock);
 
 out:
 	kfree(out_buf);
@@ -699,6 +706,7 @@ smb2_close_cached_fid(struct kref *ref)
 {
 	struct cached_fid *cfid = container_of(ref, struct cached_fid,
 					       refcount);
+	struct cached_dirent *dirent, *q;
 
 	if (cfid->is_valid) {
 		cifs_dbg(FYI, "clear cached root file handle\n");
@@ -718,6 +726,21 @@ smb2_close_cached_fid(struct kref *ref)
 		dput(cfid->dentry);
 		cfid->dentry = NULL;
 	}
+	/*
+	 * Delete all cached dirent names
+	 */
+	mutex_lock(&cfid->dirents.de_mutex);
+	list_for_each_entry_safe(dirent, q, &cfid->dirents.entries, entry) {
+		list_del(&dirent->entry);
+		kfree(dirent->name);
+		kfree(dirent);
+	}
+	cfid->dirents.is_valid = 0;
+	cfid->dirents.is_failed = 0;
+	cfid->dirents.ctx = NULL;
+	cfid->dirents.pos = 0;
+	mutex_unlock(&cfid->dirents.de_mutex);
+
 }
 
 void close_cached_dir(struct cached_fid *cfid)
@@ -754,14 +777,15 @@ smb2_cached_lease_break(struct work_struct *work)
 /*
  * Open the and cache a directory handle.
  * Only supported for the root handle.
+ * If error then *cfid is not initialized.
  */
 int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
 		const char *path,
 		struct cifs_sb_info *cifs_sb,
 		struct cached_fid **cfid)
 {
-	struct cifs_ses *ses = tcon->ses;
-	struct TCP_Server_Info *server = ses->server;
+	struct cifs_ses *ses;
+	struct TCP_Server_Info *server;
 	struct cifs_open_parms oparms;
 	struct smb2_create_rsp *o_rsp = NULL;
 	struct smb2_query_info_rsp *qi_rsp = NULL;
@@ -776,8 +800,12 @@ int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
 	struct cifs_fid *pfid;
 	struct dentry *dentry;
 
-	if (tcon->nohandlecache)
+	if (tcon == NULL || tcon->nohandlecache ||
+	    is_smb1_server(tcon->ses->server))
 		return -ENOTSUPP;
+
+	ses = tcon->ses;
+	server = ses->server;
 
 	if (cifs_sb->root == NULL)
 		return -ENOENT;
@@ -824,7 +852,7 @@ int open_cached_dir(unsigned int xid, struct cifs_tcon *tcon,
 	rqst[0].rq_nvec = SMB2_CREATE_IOV_SIZE;
 
 	oparms.tcon = tcon;
-	oparms.create_options = cifs_create_options(cifs_sb, 0);
+	oparms.create_options = cifs_create_options(cifs_sb, CREATE_NOT_FILE);
 	oparms.desired_access = FILE_READ_ATTRIBUTES;
 	oparms.disposition = FILE_OPEN;
 	oparms.fid = pfid;
@@ -1117,9 +1145,7 @@ move_smb2_ea_to_cifs(char *dst, size_t dst_size,
 	size_t name_len, value_len, user_name_len;
 
 	while (src_size > 0) {
-		name = &src->ea_data[0];
 		name_len = (size_t)src->ea_name_length;
-		value = &src->ea_data[src->ea_name_length + 1];
 		value_len = (size_t)le16_to_cpu(src->ea_value_length);
 
 		if (name_len == 0)
@@ -1130,6 +1156,9 @@ move_smb2_ea_to_cifs(char *dst, size_t dst_size,
 			rc = -EIO;
 			goto out;
 		}
+
+		name = &src->ea_data[0];
+		value = &src->ea_data[src->ea_name_length + 1];
 
 		if (ea_name) {
 			if (ea_name_len == name_len &&
@@ -2546,7 +2575,6 @@ static void
 smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 {
 	struct smb2_hdr *shdr = (struct smb2_hdr *)buf;
-	struct list_head *tmp, *tmp1;
 	struct cifs_ses *ses;
 	struct cifs_tcon *tcon;
 
@@ -2554,12 +2582,12 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 		return;
 
 	spin_lock(&cifs_tcp_ses_lock);
-	list_for_each(tmp, &server->smb_ses_list) {
-		ses = list_entry(tmp, struct cifs_ses, smb_ses_list);
-		list_for_each(tmp1, &ses->tcon_list) {
-			tcon = list_entry(tmp1, struct cifs_tcon, tcon_list);
+	list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
+		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
 			if (tcon->tid == le32_to_cpu(shdr->Id.SyncId.TreeId)) {
+				spin_lock(&tcon->tc_lock);
 				tcon->need_reconnect = true;
+				spin_unlock(&tcon->tc_lock);
 				spin_unlock(&cifs_tcp_ses_lock);
 				pr_warn_once("Server share %s deleted.\n",
 					     tcon->treeName);
@@ -2695,7 +2723,8 @@ smb2_query_info_compound(const unsigned int xid, struct cifs_tcon *tcon,
 	resp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;
 	memset(rsp_iov, 0, sizeof(rsp_iov));
 
-	rc = open_cached_dir(xid, tcon, path, cifs_sb, &cfid);
+	if (!strcmp(path, ""))
+		open_cached_dir(xid, tcon, path, cifs_sb, &cfid); /* cfid null if open dir failed */
 
 	memset(&open_iov, 0, sizeof(open_iov));
 	rqst[0].rq_iov = open_iov;
@@ -3837,7 +3866,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 		if (rc)
 			goto out;
 
-		if ((cifsi->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE) == 0)
+		if (cifsi->cifsAttrs & FILE_ATTRIBUTE_SPARSE_FILE)
 			smb2_set_sparse(xid, tcon, cfile, inode, false);
 
 		eof = cpu_to_le64(off + len);
@@ -4238,15 +4267,15 @@ smb2_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	if (oplock == SMB2_OPLOCK_LEVEL_BATCH) {
 		cinode->oplock = CIFS_CACHE_RHW_FLG;
 		cifs_dbg(FYI, "Batch Oplock granted on inode %p\n",
-			 &cinode->vfs_inode);
+			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
 		cinode->oplock = CIFS_CACHE_RW_FLG;
 		cifs_dbg(FYI, "Exclusive Oplock granted on inode %p\n",
-			 &cinode->vfs_inode);
+			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_II) {
 		cinode->oplock = CIFS_CACHE_READ_FLG;
 		cifs_dbg(FYI, "Level II Oplock granted on inode %p\n",
-			 &cinode->vfs_inode);
+			 &cinode->netfs.inode);
 	} else
 		cinode->oplock = 0;
 }
@@ -4285,7 +4314,7 @@ smb21_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 
 	cinode->oplock = new_oplock;
 	cifs_dbg(FYI, "%s Lease granted on inode %p\n", message,
-		 &cinode->vfs_inode);
+		 &cinode->netfs.inode);
 }
 
 static void
@@ -4323,11 +4352,13 @@ smb3_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	}
 }
 
+#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 static bool
 smb2_is_read_op(__u32 oplock)
 {
 	return oplock == SMB2_OPLOCK_LEVEL_II;
 }
+#endif /* CIFS_ALLOW_INSECURE_LEGACY */
 
 static bool
 smb21_is_read_op(__u32 oplock)
@@ -4532,9 +4563,11 @@ smb2_get_enc_key(struct TCP_Server_Info *server, __u64 ses_id, int enc, u8 *key)
 	list_for_each_entry(server, &cifs_tcp_ses_list, tcp_ses_list) {
 		list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
 			if (ses->Suid == ses_id) {
+				spin_lock(&ses->ses_lock);
 				ses_enc_key = enc ? ses->smb3encryptionkey :
 					ses->smb3decryptionkey;
 				memcpy(key, ses_enc_key, SMB3_ENC_DEC_KEY_SIZE);
+				spin_unlock(&ses->ses_lock);
 				spin_unlock(&cifs_tcp_ses_lock);
 				return 0;
 			}
@@ -5049,23 +5082,24 @@ static void smb2_decrypt_offload(struct work_struct *work)
 
 			mid->callback(mid);
 		} else {
-			spin_lock(&cifs_tcp_ses_lock);
-			spin_lock(&GlobalMid_Lock);
+			spin_lock(&dw->server->srv_lock);
 			if (dw->server->tcpStatus == CifsNeedReconnect) {
+				spin_lock(&dw->server->mid_lock);
 				mid->mid_state = MID_RETRY_NEEDED;
-				spin_unlock(&GlobalMid_Lock);
-				spin_unlock(&cifs_tcp_ses_lock);
+				spin_unlock(&dw->server->mid_lock);
+				spin_unlock(&dw->server->srv_lock);
 				mid->callback(mid);
 			} else {
+				spin_lock(&dw->server->mid_lock);
 				mid->mid_state = MID_REQUEST_SUBMITTED;
 				mid->mid_flags &= ~(MID_DELETED);
 				list_add_tail(&mid->qhead,
 					&dw->server->pending_mid_q);
-				spin_unlock(&GlobalMid_Lock);
-				spin_unlock(&cifs_tcp_ses_lock);
+				spin_unlock(&dw->server->mid_lock);
+				spin_unlock(&dw->server->srv_lock);
 			}
 		}
-		cifs_mid_q_entry_release(mid);
+		release_mid(mid);
 	}
 
 free_pages:
@@ -5426,7 +5460,7 @@ out:
 	return rc;
 }
 
-
+#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 struct smb_version_operations smb20_operations = {
 	.compare_fids = smb2_compare_fids,
 	.setup_request = smb2_setup_request,
@@ -5525,6 +5559,7 @@ struct smb_version_operations smb20_operations = {
 	.is_status_io_timeout = smb2_is_status_io_timeout,
 	.is_network_name_deleted = smb2_is_network_name_deleted,
 };
+#endif /* CIFS_ALLOW_INSECURE_LEGACY */
 
 struct smb_version_operations smb21_operations = {
 	.compare_fids = smb2_compare_fids,
@@ -5856,6 +5891,7 @@ struct smb_version_operations smb311_operations = {
 	.is_network_name_deleted = smb2_is_network_name_deleted,
 };
 
+#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 struct smb_version_values smb20_values = {
 	.version_string = SMB20_VERSION_STRING,
 	.protocol_id = SMB20_PROT_ID,
@@ -5876,6 +5912,7 @@ struct smb_version_values smb20_values = {
 	.signing_required = SMB2_NEGOTIATE_SIGNING_REQUIRED,
 	.create_lease_size = sizeof(struct create_lease),
 };
+#endif /* ALLOW_INSECURE_LEGACY */
 
 struct smb_version_values smb21_values = {
 	.version_string = SMB21_VERSION_STRING,

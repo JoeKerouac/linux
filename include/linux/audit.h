@@ -119,8 +119,6 @@ enum audit_nfcfgop {
 	AUDIT_NFT_OP_INVALID,
 };
 
-extern int is_audit_feature_set(int which);
-
 extern int __init audit_register_class(int class, unsigned *list);
 extern int audit_classify_syscall(int abi, unsigned syscall);
 extern int audit_classify_arch(int arch);
@@ -339,7 +337,7 @@ static inline void audit_uring_entry(u8 op)
 }
 static inline void audit_uring_exit(int success, long code)
 {
-	if (unlikely(!audit_dummy_context()))
+	if (unlikely(audit_context()))
 		__audit_uring_exit(success, code);
 }
 static inline void audit_syscall_entry(int major, unsigned long a0,

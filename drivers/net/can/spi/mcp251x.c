@@ -22,11 +22,11 @@
 #include <linux/bitfield.h>
 #include <linux/can/core.h>
 #include <linux/can/dev.h>
-#include <linux/can/led.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/ethtool.h>
 #include <linux/freezer.h>
 #include <linux/gpio.h>
 #include <linux/gpio/driver.h>
@@ -738,8 +738,6 @@ static void mcp251x_hw_rx(struct spi_device *spi, int buf_idx)
 	}
 	priv->net->stats.rx_packets++;
 
-	can_led_event(priv->net, CAN_LED_EVENT_RX);
-
 	netif_rx(skb);
 }
 
@@ -973,8 +971,6 @@ static int mcp251x_stop(struct net_device *net)
 
 	mutex_unlock(&priv->mcp_lock);
 
-	can_led_event(net, CAN_LED_EVENT_STOP);
-
 	return 0;
 }
 
@@ -1177,7 +1173,6 @@ static irqreturn_t mcp251x_can_ist(int irq, void *dev_id)
 			break;
 
 		if (intf & CANINTF_TX) {
-			can_led_event(net, CAN_LED_EVENT_TX);
 			if (priv->tx_busy) {
 				net->stats.tx_packets++;
 				net->stats.tx_bytes += can_get_echo_skb(net, 0,
@@ -1232,8 +1227,6 @@ static int mcp251x_open(struct net_device *net)
 	if (ret)
 		goto out_free_irq;
 
-	can_led_event(net, CAN_LED_EVENT_OPEN);
-
 	netif_wake_queue(net);
 	mutex_unlock(&priv->mcp_lock);
 
@@ -1254,6 +1247,10 @@ static const struct net_device_ops mcp251x_netdev_ops = {
 	.ndo_stop = mcp251x_stop,
 	.ndo_start_xmit = mcp251x_hard_start_xmit,
 	.ndo_change_mtu = can_change_mtu,
+};
+
+static const struct ethtool_ops mcp251x_ethtool_ops = {
+	.get_ts_info = ethtool_op_get_ts_info,
 };
 
 static const struct of_device_id mcp251x_of_match[] = {
@@ -1321,6 +1318,7 @@ static int mcp251x_can_probe(struct spi_device *spi)
 		goto out_free;
 
 	net->netdev_ops = &mcp251x_netdev_ops;
+	net->ethtool_ops = &mcp251x_ethtool_ops;
 	net->flags |= IFF_ECHO;
 
 	priv = netdev_priv(net);
@@ -1402,8 +1400,6 @@ static int mcp251x_can_probe(struct spi_device *spi)
 	ret = register_candev(net);
 	if (ret)
 		goto error_probe;
-
-	devm_can_led_init(net);
 
 	ret = mcp251x_gpio_setup(priv);
 	if (ret)

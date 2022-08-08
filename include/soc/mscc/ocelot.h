@@ -105,6 +105,11 @@
 #define REG_RESERVED_ADDR		0xffffffff
 #define REG_RESERVED(reg)		REG(reg, REG_RESERVED_ADDR)
 
+#define for_each_stat(ocelot, stat)				\
+	for ((stat) = (ocelot)->stats_layout;			\
+	     ((stat)->name[0] != '\0');				\
+	     (stat)++)
+
 enum ocelot_target {
 	ANA = 1,
 	QS,
@@ -538,6 +543,8 @@ struct ocelot_stat_layout {
 	char name[ETH_GSTRING_LEN];
 };
 
+#define OCELOT_STAT_END { .name = "" }
+
 struct ocelot_stats_region {
 	struct list_head node;
 	u32 offset;
@@ -568,6 +575,7 @@ struct ocelot_ops {
 	int (*psfp_stats_get)(struct ocelot *ocelot, struct flow_cls_offload *f,
 			      struct flow_stats *stats);
 	void (*cut_through_fwd)(struct ocelot *ocelot);
+	void (*tas_clock_adjust)(struct ocelot *ocelot);
 };
 
 struct ocelot_vcap_policer {
@@ -647,34 +655,43 @@ struct ocelot_mirror {
 	int to;
 };
 
+struct ocelot_port;
+
 struct ocelot_port {
 	struct ocelot			*ocelot;
 
 	struct regmap			*target;
 
-	bool				vlan_aware;
+	struct net_device		*bond;
+	struct net_device		*bridge;
+
+	struct ocelot_port		*dsa_8021q_cpu;
+
 	/* VLAN that untagged frames are classified to, on ingress */
 	const struct ocelot_bridge_vlan	*pvid_vlan;
 
-	unsigned int			ptp_skbs_in_flight;
-	u8				ptp_cmd;
-	struct sk_buff_head		tx_skbs;
-	u8				ts_id;
+	struct tc_taprio_qopt_offload	*taprio;
 
 	phy_interface_t			phy_mode;
 
-	u8				*xmit_template;
-	bool				is_dsa_8021q_cpu;
-	bool				learn_ena;
-
-	struct net_device		*bond;
-	bool				lag_tx_active;
+	unsigned int			ptp_skbs_in_flight;
+	struct sk_buff_head		tx_skbs;
 
 	u16				mrp_ring_id;
 
-	struct net_device		*bridge;
-	int				bridge_num;
+	u8				ptp_cmd;
+	u8				ts_id;
+
+	u8				index;
+
 	u8				stp_state;
+	bool				vlan_aware;
+	bool				is_dsa_8021q_cpu;
+	bool				learn_ena;
+
+	bool				lag_tx_active;
+
+	int				bridge_num;
 
 	int				speed;
 };
@@ -742,6 +759,9 @@ struct ocelot {
 	struct mutex			mact_lock;
 	/* Lock for serializing forwarding domain changes */
 	struct mutex			fwd_domain_lock;
+
+	/* Lock for serializing Time-Aware Shaper changes */
+	struct mutex			tas_lock;
 
 	struct workqueue_struct		*owq;
 
@@ -855,8 +875,9 @@ void ocelot_deinit(struct ocelot *ocelot);
 void ocelot_init_port(struct ocelot *ocelot, int port);
 void ocelot_deinit_port(struct ocelot *ocelot, int port);
 
-void ocelot_port_set_dsa_8021q_cpu(struct ocelot *ocelot, int port);
-void ocelot_port_unset_dsa_8021q_cpu(struct ocelot *ocelot, int port);
+void ocelot_port_assign_dsa_8021q_cpu(struct ocelot *ocelot, int port, int cpu);
+void ocelot_port_unassign_dsa_8021q_cpu(struct ocelot *ocelot, int port);
+u32 ocelot_port_assigned_dsa_8021q_cpu_mask(struct ocelot *ocelot, int port);
 
 /* DSA callbacks */
 void ocelot_get_strings(struct ocelot *ocelot, int port, u32 sset, u8 *data);
@@ -868,9 +889,7 @@ void ocelot_set_ageing_time(struct ocelot *ocelot, unsigned int msecs);
 int ocelot_port_vlan_filtering(struct ocelot *ocelot, int port, bool enabled,
 			       struct netlink_ext_ack *extack);
 void ocelot_bridge_stp_state_set(struct ocelot *ocelot, int port, u8 state);
-u32 ocelot_get_dsa_8021q_cpu_mask(struct ocelot *ocelot);
 u32 ocelot_get_bridge_fwd_mask(struct ocelot *ocelot, int src_port);
-void ocelot_apply_bridge_fwd_mask(struct ocelot *ocelot, bool joining);
 int ocelot_port_pre_bridge_flags(struct ocelot *ocelot, int port,
 				 struct switchdev_brport_flags val);
 void ocelot_port_bridge_flags(struct ocelot *ocelot, int port,
@@ -990,6 +1009,9 @@ int ocelot_mact_learn_streamdata(struct ocelot *ocelot, int dst_idx,
 				 unsigned int vid,
 				 enum macaccess_entry_type type,
 				 int sfid, int ssid);
+
+int ocelot_migrate_mdbs(struct ocelot *ocelot, unsigned long from_mask,
+			unsigned long to_mask);
 
 int ocelot_vcap_policer_add(struct ocelot *ocelot, u32 pol_ix,
 			    struct ocelot_policer *pol);
